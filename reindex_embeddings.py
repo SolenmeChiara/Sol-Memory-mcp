@@ -99,8 +99,13 @@ def run_reindex(
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
 
+    # Skip digested rows — they're archived merge-source fragments and don't
+    # participate in search anymore, so spending LLM cycles on their embeddings
+    # would be pure waste.
     rows = conn.execute(
-        "SELECT id, content FROM memories WHERE length(embedding) = 0 ORDER BY rowid"
+        "SELECT id, content FROM memories "
+        "WHERE length(embedding) = 0 AND digested = 0 "
+        "ORDER BY rowid"
     ).fetchall()
     if limit > 0:
         rows = rows[:limit]
@@ -245,7 +250,9 @@ def main() -> None:
 
     # First, log the scan so CLI users see what's happening before progress_cb fires
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    pending = conn.execute("SELECT COUNT(*) FROM memories WHERE length(embedding)=0").fetchone()[0]
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE length(embedding)=0 AND digested=0"
+    ).fetchone()[0]
     conn.close()
     if args.limit > 0:
         pending = min(pending, args.limit)

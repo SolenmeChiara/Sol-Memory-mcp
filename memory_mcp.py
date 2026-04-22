@@ -58,6 +58,10 @@ MMR_LAMBDA: float = float(os.environ.get("MMR_LAMBDA", "0.7"))              # MM
 MMR_POOL_MULT: int = int(os.environ.get("MMR_POOL_MULT", "4"))              # pool = max(limit * MMR_POOL_MULT, 20)
 MMR_MIN_CANDIDATES: int = int(os.environ.get("MMR_MIN_CANDIDATES", "5"))    # below this MMR is skipped
 
+# ---- Digested-row retention ----
+DIGESTED_PRUNE_DAYS: int = int(os.environ.get("DIGESTED_PRUNE_DAYS", "90"))                  # hard-delete digested rows older than this
+DIGESTED_PRUNE_INTERVAL_HOURS: float = float(os.environ.get("DIGESTED_PRUNE_INTERVAL_HOURS", "24"))  # daemon sweep interval
+
 SUMMARIZE_DRY_RUN: bool = False
 
 
@@ -73,6 +77,22 @@ def _load_dotenv(root: Path) -> None:
             continue
         k, v = line.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def _start_prune_daemon(store: "MemoryStore") -> None:
+    """Background sweeper that hard-deletes digested rows past their retention
+    window. Sweeps every DIGESTED_PRUNE_INTERVAL_HOURS hours.
+    """
+    def _loop() -> None:
+        while True:
+            _time_mod.sleep(DIGESTED_PRUNE_INTERVAL_HOURS * 3600)
+            try:
+                store.prune_stale_digested(DIGESTED_PRUNE_DAYS)
+            except Exception as exc:
+                sys.stderr.write(f"[prune-daemon] error: {exc}\n")
+                sys.stderr.flush()
+
+    threading.Thread(target=_loop, daemon=True, name="prune-daemon").start()
 
 
 def _call_ollama(prompt: str) -> str:
@@ -206,7 +226,7 @@ def _compose_breath_output(
     # 2) Unresolved candidate pool
     with store._lock:
         un_rows = store.conn.execute(
-            "SELECT * FROM memories WHERE resolved=0 AND pinned=0 "
+            "SELECT * FROM memories WHERE resolved=0 AND pinned=0 AND digested=0 "
             "AND memory_kind='long_term' ORDER BY updated_at DESC LIMIT 200"
         ).fetchall()
     un_recs = [store._row_to_record(r) for r in un_rows]
@@ -451,7 +471,8 @@ class MemoryStore:
         with self._lock:
             rows = self.conn.execute(
                 "SELECT id, embedding FROM memories "
-                "WHERE memory_kind='long_term' AND length(embedding) > 0"
+                "WHERE memory_kind='long_term' AND digested = 0 "
+                "AND length(embedding) > 0"
             ).fetchall()
 
         dim: Optional[int] = None
@@ -541,6 +562,36 @@ class MemoryStore:
         # argpartition doesn't order the top-k internally — resort.
         top_idx = top_idx[np.argsort(-sims[top_idx])]
         return [(ids[int(i)], float(sims[int(i)])) for i in top_idx]
+
+    def prune_stale_digested(self, threshold_days: int = 90) -> int:
+        """Hard-delete digested rows whose last contact (last_active or updated_at)
+        is older than threshold_days. Returns number of rows deleted.
+
+        digested rows are merge-source fragments — once they've been kept for
+        a sane retention window without any explicit recall (via
+        extmcp_recall_session), they can go. Keeping them forever bloats the
+        db without helping search (they're filtered out everywhere).
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=threshold_days)).isoformat()
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM memories "
+                "WHERE digested = 1 "
+                "AND COALESCE(NULLIF(last_active, ''), updated_at, created_at) < ?",
+                (cutoff,),
+            )
+            self.conn.commit()
+            n = cur.rowcount
+        if n > 0:
+            sys.stderr.write(
+                f"[memstore] pruned {n} stale digested rows "
+                f"(>{threshold_days} days since last contact)\n"
+            )
+            sys.stderr.flush()
+            # Embedding cache only contained non-digested rows anyway, but
+            # rebuild on next search just to be safe.
+            self._mark_emb_dirty()
+        return n
 
     def touch_memory(self, memory_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -643,9 +694,12 @@ class MemoryStore:
         return cur.rowcount > 0
 
     def list_memories(self, limit: int = 50, memory_kind: str = "long_term") -> List[MemoryRecord]:
+        # digested rows are archived merge-source fragments — they exist for
+        # audit/recall_session but should not surface in normal listings.
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM memories WHERE memory_kind = ? ORDER BY updated_at DESC LIMIT ?",
+                "SELECT * FROM memories WHERE memory_kind = ? AND digested = 0 "
+                "ORDER BY updated_at DESC LIMIT ?",
                 (memory_kind, limit),
             ).fetchall()
         return [self._row_to_record(r) for r in rows]
@@ -653,7 +707,8 @@ class MemoryStore:
     def random_memories(self, count: int, memory_kind: str = "long_term") -> List[MemoryRecord]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM memories WHERE memory_kind = ? ORDER BY RANDOM() LIMIT ?",
+                "SELECT * FROM memories WHERE memory_kind = ? AND digested = 0 "
+                "ORDER BY RANDOM() LIMIT ?",
                 (memory_kind, count),
             ).fetchall()
         return [self._row_to_record(r) for r in rows]
@@ -689,7 +744,7 @@ class MemoryStore:
                     SELECT m.*, bm25(memories_fts) AS keyword_score
                     FROM memories_fts
                     JOIN memories m ON m.rowid = memories_fts.rowid
-                    WHERE memories_fts MATCH ? AND m.memory_kind = ?
+                    WHERE memories_fts MATCH ? AND m.memory_kind = ? AND m.digested = 0
                     ORDER BY keyword_score LIMIT ?
                     """,
                     (" OR ".join(dict.fromkeys(tokens)) or query, memory_kind, fallback_limit),
@@ -707,7 +762,7 @@ class MemoryStore:
             params.append(fallback_limit)
             with self._lock:
                 keyword_rows = self.conn.execute(
-                    f"SELECT *, 0.5 AS keyword_score FROM memories WHERE memory_kind = ? AND ({where}) ORDER BY updated_at DESC LIMIT ?",
+                    f"SELECT *, 0.5 AS keyword_score FROM memories WHERE memory_kind = ? AND digested = 0 AND ({where}) ORDER BY updated_at DESC LIMIT ?",
                     tuple(params),
                 ).fetchall()
 
@@ -1256,6 +1311,7 @@ h1{color:var(--fg);font-size:28px;margin-bottom:6px}
   <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
     <button id="btnReindex" style="padding:11px 18px;border:1px solid var(--card-border);border-radius:8px;background:var(--card-bg);color:var(--fg);cursor:pointer;font-size:13px">补齐 Embedding</button>
     <button id="btnConsolidate" style="padding:11px 18px;border:1px solid var(--card-border);border-radius:8px;background:var(--card-bg);color:var(--fg);cursor:pointer;font-size:13px">合并 Session</button>
+    <button id="btnPrune" style="padding:11px 18px;border:1px solid var(--card-border);border-radius:8px;background:var(--card-bg);color:var(--fg);cursor:pointer;font-size:13px">清理过期归档</button>
     <span id="consolidateHint" style="color:var(--formats);font-size:12px;align-self:center"></span>
   </div>
   <div id="statusSection">
@@ -1272,7 +1328,7 @@ const pf=document.getElementById('progFill'),ra=document.getElementById('resultA
 const pathIn=document.getElementById('pathInput'),pathBtn=document.getElementById('pathSubmit');
 const stLine=document.getElementById('statusLine');
 const statsBlock=document.getElementById('statsBlock');
-const btnReindex=document.getElementById('btnReindex'),btnConsolidate=document.getElementById('btnConsolidate');
+const btnReindex=document.getElementById('btnReindex'),btnConsolidate=document.getElementById('btnConsolidate'),btnPrune=document.getElementById('btnPrune');
 const consolidateHint=document.getElementById('consolidateHint');
 const SIZE_LIMIT=30*1024*1024;
 
@@ -1289,9 +1345,15 @@ async function refreshStats(){
       `缺 embedding: <b>${s.missing_embedding}</b><br>`+
       `未合并 session (≥5 条): <b>${s.unconsolidated_sessions_over_5}</b> · `+
       `pinned: <b>${s.pinned_count}</b><br>`+
+      `归档碎片: <b>${s.digested_total}</b> (其中 <b>${s.digested_stale}</b> 条超 ${s.prune_days} 天可清理)<br>`+
       `活跃任务: ${activeLine}`;
     btnReindex.disabled=s.missing_embedding===0;
     btnReindex.style.opacity=btnReindex.disabled?'0.4':'1';
+    btnPrune.disabled=s.digested_stale===0;
+    btnPrune.style.opacity=btnPrune.disabled?'0.4':'1';
+    btnPrune.textContent=s.digested_stale>0
+      ? `清理过期归档 (${s.digested_stale})`
+      : '清理过期归档';
     if(!s.openrouter_key_present){
       btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
       consolidateHint.textContent='未检测到 OPENROUTER_API_KEY（.env 未配置或需重启 server）';
@@ -1391,6 +1453,20 @@ async function pollAdminTask(taskId,kind){
 btnReindex.addEventListener('click',()=>{
   if(!confirm('启动 embedding 补齐任务？会占用 ollama/bge-m3。')) return;
   startAdminTask('reindex',{workers:4,batch:50});
+});
+btnPrune.addEventListener('click',async()=>{
+  const days=prompt('删除超过多少天没被提及的归档碎片？(默认 90)','90');
+  if(days===null)return;
+  const n=parseInt(days)||90;
+  if(!confirm('这是永久删除 (DELETE)，不可逆。确认清理超过 '+n+' 天的归档碎片？')) return;
+  resetUI();setP(50);addLog('调用 /admin/prune days='+n);
+  try{
+    const r=await fetch('/admin/prune',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:n})});
+    const d=await r.json();
+    setP(100);
+    if(d.ok){addLog('已删除 '+d.deleted+' 条','ok');refreshStats()}
+    else{addLog('错误: '+(d.error||JSON.stringify(d)),'err')}
+  }catch(e){addLog('请求失败: '+e.message,'err')}
 });
 btnConsolidate.addEventListener('click',()=>{
   const maxFrag=prompt('只合并碎片数 ≤ N 的 session（留空=全部；建议第一次填 49 先跑短中 session）：','49');
@@ -2039,7 +2115,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
     elif name == "extmcp_dream":
         with store._lock:
             rows = store.conn.execute(
-                "SELECT * FROM memories WHERE memory_kind='long_term' AND pinned=0 "
+                "SELECT * FROM memories WHERE memory_kind='long_term' AND pinned=0 AND digested=0 "
                 "ORDER BY updated_at DESC LIMIT 10"
             ).fetchall()
         recs = [store._row_to_record(r) for r in rows]
@@ -2055,7 +2131,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         with store._lock:
             emb_rows = store.conn.execute(
                 "SELECT id, embedding FROM memories "
-                "WHERE memory_kind='long_term' AND pinned=0 AND length(embedding)>0 "
+                "WHERE memory_kind='long_term' AND pinned=0 AND digested=0 AND length(embedding)>0 "
                 "ORDER BY updated_at DESC LIMIT 10"
             ).fetchall()
         emb_map: dict[str, list] = {r["id"]: _unpack_embedding(r["embedding"]) for r in emb_rows}
@@ -2208,6 +2284,15 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 (session_id,),
             ).fetchall()
         recs = [store._row_to_record(r) for r in rows]
+        # Recalling a session counts as touching every fragment in it — keeps
+        # them out of the prune-daemon's 90-day cleanup window. Quiet failure
+        # tolerated since touch is best-effort here (recall_session itself must
+        # always return successfully).
+        for rec in recs:
+            try:
+                store.touch_memory(rec.id)
+            except Exception:
+                pass
         items = [
             {
                 "id": r.id, "key": r.key, "content": r.content,
@@ -2540,7 +2625,17 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                     "SELECT COUNT(*) FROM memories WHERE pinned=1 AND memory_kind='long_term'"
                 ).fetchone()[0]
                 missing_emb = store.conn.execute(
-                    "SELECT COUNT(*) FROM memories WHERE memory_kind='long_term' AND length(embedding) = 0"
+                    "SELECT COUNT(*) FROM memories WHERE memory_kind='long_term' "
+                    "AND digested = 0 AND length(embedding) = 0"
+                ).fetchone()[0]
+                digested_total = store.conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE memory_kind='long_term' AND digested = 1"
+                ).fetchone()[0]
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=DIGESTED_PRUNE_DAYS)).isoformat()
+                digested_stale = store.conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE memory_kind='long_term' AND digested = 1 "
+                    "AND COALESCE(NULLIF(last_active, ''), updated_at, created_at) < ?",
+                    (cutoff,),
                 ).fetchone()[0]
                 unconsolidated_sessions = store.conn.execute(
                     "SELECT COUNT(*) FROM ("
@@ -2568,6 +2663,9 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 "missing_embedding": missing_emb,
                 "unconsolidated_sessions_over_5": unconsolidated_sessions,
                 "pinned_count": pinned,
+                "digested_total": digested_total,
+                "digested_stale": digested_stale,
+                "prune_days": DIGESTED_PRUNE_DAYS,
                 "active_tasks": active,
                 "openrouter_key_present": bool(os.environ.get("OPENROUTER_API_KEY")),
             })
@@ -2590,6 +2688,18 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
             }
             task = _start_admin_task(store, "reindex", run_reindex, kwargs)
             self._send_json(200, {"ok": True, "async": True, "task_id": task["id"]})
+
+        def _handle_admin_prune(self) -> None:
+            """POST /admin/prune — hard-delete digested rows older than threshold_days."""
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+            except json.JSONDecodeError:
+                data = {}
+            days = max(1, int(data.get("days", DIGESTED_PRUNE_DAYS) or DIGESTED_PRUNE_DAYS))
+            n = store.prune_stale_digested(days)
+            self._send_json(200, {"ok": True, "deleted": n, "threshold_days": days})
 
         def _handle_admin_consolidate(self) -> None:
             """POST /admin/consolidate — kick off consolidate_sessions in the background."""
@@ -2779,6 +2889,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_admin_reindex()
             elif path == "/admin/consolidate":
                 self._handle_admin_consolidate()
+            elif path == "/admin/prune":
+                self._handle_admin_prune()
             else:
                 self._handle_legacy_post()
 
@@ -2908,6 +3020,14 @@ def main() -> None:
     _load_dotenv(Path(__file__).parent)
 
     store = MemoryStore(db_path)
+
+    # One eager prune at startup so users see immediate effect after raising
+    # DIGESTED_PRUNE_DAYS or after a long downtime; then schedule the daemon.
+    try:
+        store.prune_stale_digested(DIGESTED_PRUNE_DAYS)
+    except Exception as exc:
+        sys.stderr.write(f"[prune-startup] error: {exc}\n")
+    _start_prune_daemon(store)
 
     if args.http:
         _run_http(store, args.host, args.port)
