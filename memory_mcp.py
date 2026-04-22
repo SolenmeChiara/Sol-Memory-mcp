@@ -27,6 +27,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+import numpy as np  # vectorised cosine — see requirements.txt
+
 # Reuse multi-format parsing/iteration from batch_import.py.
 # We only borrow pure-data helpers; LLM/embedding calls stay on this module's
 # functions so they share the same Ollama config.
@@ -48,7 +50,29 @@ OLLAMA_TIMEOUT: float = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
 OLLAMA_EMBED_MODEL: str = os.environ.get("OLLAMA_EMBED_MODEL", "bge-m3")
 DECAY_LAMBDA: float = float(os.environ.get("DECAY_LAMBDA", "0.05"))
 DECAY_THRESHOLD: float = float(os.environ.get("DECAY_THRESHOLD", "0.3"))
+
+# ---- Retrieval quality tuning (env-overridable) ----
+SEARCH_ALPHA: float = float(os.environ.get("SEARCH_ALPHA", "0.4"))          # relative threshold: keep rel >= top * α
+SEARCH_ABS_FLOOR: float = float(os.environ.get("SEARCH_ABS_FLOOR", "0.15")) # absolute floor applied alongside α
+MMR_LAMBDA: float = float(os.environ.get("MMR_LAMBDA", "0.7"))              # MMR weight on relevance vs diversity
+MMR_POOL_MULT: int = int(os.environ.get("MMR_POOL_MULT", "4"))              # pool = max(limit * MMR_POOL_MULT, 20)
+MMR_MIN_CANDIDATES: int = int(os.environ.get("MMR_MIN_CANDIDATES", "5"))    # below this MMR is skipped
+
 SUMMARIZE_DRY_RUN: bool = False
+
+
+def _load_dotenv(root: Path) -> None:
+    """Minimal .env loader shared with maintenance scripts. Populates os.environ
+    with KEY=VALUE pairs from <root>/.env if present. Existing env vars win."""
+    env_path = root / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 def _call_ollama(prompt: str) -> str:
@@ -335,6 +359,18 @@ class MemoryStore:
             self.conn.execute("PRAGMA busy_timeout=5000")
         self._init_db()
 
+        # ---- Embedding index cache ----
+        # All long_term embeddings held as a pre-L2-normalised float32 matrix in
+        # RAM so search becomes a single `matrix @ q_unit` matmul. Lazy-built on
+        # first search; writes (upsert/delete/embed-worker update) set dirty,
+        # next search rebuilds. Rebuilds are atomic (replace pointer under lock)
+        # so concurrent searches either see the old index or the new one.
+        self._emb_matrix: Optional[np.ndarray] = None   # shape (N, D), unit vectors
+        self._emb_ids: List[str] = []                   # row-parallel with _emb_matrix
+        self._emb_version: int = 0
+        self._emb_lock = threading.RLock()
+        self._emb_dirty: bool = True
+
     def _init_db(self) -> None:
         with self._lock:
             self.conn.executescript(
@@ -387,11 +423,124 @@ class MemoryStore:
                 ("activation_count", "REAL DEFAULT 1.0"),
                 ("last_active",      "TEXT DEFAULT ''"),
                 ("last_breath_at",   "TEXT DEFAULT ''"),  # cooldown for breath-induced touch
+                ("consolidated",     "INTEGER DEFAULT 0"),  # marks merge-products; excluded from future consolidate runs
             ]
             for col_name, col_def in _NEW_COLS:
                 if col_name not in columns:
                     self.conn.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
             self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Embedding index (numpy unit-vector cache)
+    # ------------------------------------------------------------------
+
+    def _mark_emb_dirty(self) -> None:
+        with self._emb_lock:
+            self._emb_dirty = True
+
+    def _rebuild_emb_index(self) -> None:
+        """Rebuild the unit-vector matrix from scratch. Called lazily from search().
+
+        Validates each blob (length must be a multiple of 4; all rows must share
+        dim; zero-norm vectors skipped). Constructs a new contiguous matrix via
+        np.empty pre-allocation and atomically swaps the cached pointer under
+        `_emb_lock` so concurrent readers either see the old or the new cache,
+        never a half-built one.
+        """
+        t0 = _time_mod.monotonic()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, embedding FROM memories "
+                "WHERE memory_kind='long_term' AND length(embedding) > 0"
+            ).fetchall()
+
+        dim: Optional[int] = None
+        blobs: List[tuple[str, bytes]] = []
+        for r in rows:
+            blob = r["embedding"]
+            if not blob or len(blob) % 4 != 0:
+                sys.stderr.write(f"[memstore] skip {r['id']}: bad blob len={len(blob) if blob else 0}\n")
+                continue
+            this_dim = len(blob) // 4
+            if dim is None:
+                dim = this_dim
+            elif this_dim != dim:
+                sys.stderr.write(f"[memstore] skip {r['id']}: dim {this_dim} != {dim}\n")
+                continue
+            blobs.append((r["id"], blob))
+
+        if not blobs or dim is None:
+            with self._emb_lock:
+                self._emb_matrix = None
+                self._emb_ids = []
+                self._emb_version += 1
+                self._emb_dirty = False
+            sys.stderr.write(f"[memstore] rebuild_emb_index: empty ({_time_mod.monotonic()-t0:.3f}s)\n")
+            return
+
+        matrix = np.empty((len(blobs), dim), dtype=np.float32)
+        ids: List[str] = []
+        write_idx = 0
+        for mid, blob in blobs:
+            vec = np.frombuffer(blob, dtype=np.float32)
+            norm = float(np.linalg.norm(vec))
+            if norm < 1e-9:
+                sys.stderr.write(f"[memstore] skip {mid}: zero-norm\n")
+                continue
+            matrix[write_idx] = vec / norm
+            ids.append(mid)
+            write_idx += 1
+
+        if write_idx < len(blobs):
+            matrix = matrix[:write_idx].copy()   # trim
+
+        with self._emb_lock:
+            self._emb_matrix = matrix
+            self._emb_ids = ids
+            self._emb_version += 1
+            self._emb_dirty = False
+
+        sys.stderr.write(
+            f"[memstore] rebuild_emb_index: {write_idx} vecs, dim={dim}, "
+            f"v{self._emb_version}, {(_time_mod.monotonic()-t0)*1000:.1f}ms\n"
+        )
+
+    def _vector_search(
+        self, query_embedding: List[float], top_k: int,
+    ) -> list[tuple[str, float]]:
+        """Return (memory_id, cosine_similarity) top_k most similar."""
+        with self._emb_lock:
+            if self._emb_dirty or self._emb_matrix is None:
+                dirty = True
+            else:
+                dirty = False
+        if dirty:
+            self._rebuild_emb_index()
+
+        with self._emb_lock:
+            matrix = self._emb_matrix
+            ids = list(self._emb_ids)
+
+        if matrix is None or not ids:
+            return []
+
+        q = np.asarray(query_embedding, dtype=np.float32)
+        qn = float(np.linalg.norm(q))
+        if qn < 1e-9:
+            return []
+        q_unit = q / qn
+
+        sims = matrix @ q_unit   # (N,)
+        k = min(top_k, sims.shape[0])
+        if k <= 0:
+            return []
+        if k < sims.shape[0]:
+            top_idx = np.argpartition(-sims, k - 1)[:k]
+        else:
+            top_idx = np.arange(sims.shape[0])
+        # argpartition doesn't order the top-k internally — resort.
+        top_idx = top_idx[np.argsort(-sims[top_idx])]
+        return [(ids[int(i)], float(sims[int(i)])) for i in top_idx]
 
     def touch_memory(self, memory_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -474,6 +623,8 @@ class MemoryStore:
             row = self.conn.execute(
                 "SELECT * FROM memories WHERE id = ?", (memory_id,)
             ).fetchone()
+        # Any upsert may add/change an embedding → invalidate cache.
+        self._mark_emb_dirty()
         return self._row_to_record(row)
 
     def get_memory(self, memory_id: str) -> Optional[MemoryRecord]:
@@ -487,6 +638,8 @@ class MemoryStore:
         with self._lock:
             cur = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
             self.conn.commit()
+        if cur.rowcount > 0:
+            self._mark_emb_dirty()
         return cur.rowcount > 0
 
     def list_memories(self, limit: int = 50, memory_kind: str = "long_term") -> List[MemoryRecord]:
@@ -512,9 +665,23 @@ class MemoryStore:
         limit: int = 8,
         memory_kind: str = "long_term",
     ) -> List[MemoryRecord]:
+        """Hybrid BM25 + vector cosine search with relative-threshold + MMR.
+
+        Pipeline:
+          1. FTS5 BM25 keyword hits (+ LIKE fallback)
+          2. numpy matmul top-k vector hits via _vector_search
+          3. Merge, compute relevance_score = vec_w * vec + kw_w * kw
+          4. Apply relative threshold: keep rel >= max(ABS_FLOOR, top_rel * α)
+          5. MMR rerank (diversity) on pool of max(limit*MMR_POOL_MULT, 20)
+          6. Return top `limit`
+        """
+        t_total = _time_mod.monotonic()
+        timing: Dict[str, float] = {}
         fallback_limit = max(limit * 6, 24)
         tokens = [t.strip() for t in query.replace("\uff0c", " ").replace(",", " ").split() if t.strip()]
 
+        # ---- 1. Keyword (BM25) ----
+        t0 = _time_mod.monotonic()
         try:
             with self._lock:
                 keyword_rows = self.conn.execute(
@@ -551,23 +718,33 @@ class MemoryStore:
                 rec = self._row_to_record(r)
                 rec.keyword_score = 1.0 - min(abs(float(r["keyword_score"])) / max_s, 1.0)
                 keyword_hits.append(rec)
+        timing["kw_ms"] = (_time_mod.monotonic() - t0) * 1000
 
+        # ---- 2. Vector (numpy matmul via _vector_search) ----
+        t0 = _time_mod.monotonic()
         vector_hits: list[MemoryRecord] = []
         if query_embedding:
-            with self._lock:
-                rows = self.conn.execute(
-                    "SELECT * FROM memories WHERE memory_kind = ? AND length(embedding) > 0",
-                    (memory_kind,),
-                ).fetchall()
-            for r in rows:
-                s = _cosine_similarity(query_embedding, _unpack_embedding(r["embedding"]))
-                if s > 0.0:
-                    rec = self._row_to_record(r)
-                    rec.vector_score = s
-                    vector_hits.append(rec)
-            vector_hits.sort(key=lambda x: x.vector_score, reverse=True)
-            vector_hits = vector_hits[:max(limit * 3, limit)]
+            top_k = max(limit * MMR_POOL_MULT, 20)
+            id_scores = self._vector_search(query_embedding, top_k=top_k)
+            if id_scores:
+                id_to_score = {mid: score for mid, score in id_scores}
+                placeholders = ",".join("?" * len(id_to_score))
+                with self._lock:
+                    rows = self.conn.execute(
+                        f"SELECT * FROM memories WHERE id IN ({placeholders}) AND memory_kind = ?",
+                        (*id_to_score.keys(), memory_kind),
+                    ).fetchall()
+                for r in rows:
+                    s = id_to_score.get(r["id"], 0.0)
+                    if s > 0.0:
+                        rec = self._row_to_record(r)
+                        rec.vector_score = s
+                        vector_hits.append(rec)
+                vector_hits.sort(key=lambda x: x.vector_score, reverse=True)
+        timing["vec_ms"] = (_time_mod.monotonic() - t0) * 1000
 
+        # ---- 3. Merge + relevance ----
+        t0 = _time_mod.monotonic()
         merged: dict[str, MemoryRecord] = {}
         for rec in keyword_hits:
             merged[rec.id] = rec
@@ -576,12 +753,82 @@ class MemoryStore:
                 merged[rec.id].vector_score = max(merged[rec.id].vector_score, rec.vector_score)
             else:
                 merged[rec.id] = rec
-
         items = list(merged.values())
         for rec in items:
             rec.final_score = self.vector_weight * rec.vector_score + self.keyword_weight * rec.keyword_score
         items.sort(key=lambda x: x.final_score, reverse=True)
-        return items[:limit]
+        timing["merge_ms"] = (_time_mod.monotonic() - t0) * 1000
+
+        # ---- 4. Relative threshold (pre-MMR, so basis is untouched) ----
+        before_thr = len(items)
+        if items:
+            threshold = max(SEARCH_ABS_FLOOR, items[0].final_score * SEARCH_ALPHA)
+            items = [r for r in items if r.final_score >= threshold]
+        timing["threshold_pruned"] = before_thr - len(items)
+
+        # ---- 5. MMR rerank on expanded pool ----
+        t0 = _time_mod.monotonic()
+        pool = items[: max(limit * MMR_POOL_MULT, 20)]
+        if len(pool) >= MMR_MIN_CANDIDATES:
+            pool = self._mmr_rerank(pool, limit)
+        final = pool[:limit]
+        timing["mmr_ms"] = (_time_mod.monotonic() - t0) * 1000
+
+        timing["total_ms"] = (_time_mod.monotonic() - t_total) * 1000
+        sys.stderr.write(
+            f"[search] query={query!r:.40s} "
+            f"kw={len(keyword_hits)} vec={len(vector_hits)} "
+            f"before_thr={before_thr} pruned={int(timing['threshold_pruned'])} "
+            f"returned={len(final)} idx_v{self._emb_version} "
+            f"kw={timing['kw_ms']:.1f}ms vec={timing['vec_ms']:.1f}ms "
+            f"merge={timing['merge_ms']:.1f}ms mmr={timing['mmr_ms']:.1f}ms "
+            f"total={timing['total_ms']:.1f}ms\n"
+        )
+        sys.stderr.flush()
+        return final
+
+    def _mmr_rerank(self, items: List[MemoryRecord], limit: int) -> List[MemoryRecord]:
+        """MMR diversity rerank. Uses the embedding cache matrix for cosine.
+
+        score(c) = λ · relevance(c) - (1-λ) · max(cos(c, selected), 0)
+
+        Records without embedding fall back to pure relevance (lambda * score).
+        Redundancy cos is clamped to non-negative so diagonal-opposite vectors
+        don't get a "diversity bonus".
+        """
+        if len(items) <= 1:
+            return items
+        with self._emb_lock:
+            matrix = self._emb_matrix
+            ids_to_idx = {mid: i for i, mid in enumerate(self._emb_ids)} if matrix is not None else {}
+
+        # Map each item to its row in the matrix (may be None for keyword-only hits)
+        emb_idx: Dict[str, Optional[int]] = {r.id: ids_to_idx.get(r.id) for r in items}
+
+        selected: List[MemoryRecord] = []
+        candidates = list(items)
+        while candidates and len(selected) < limit:
+            best_i = 0
+            best_score = -1e9
+            # Pre-fetch selected embedding rows once per outer loop
+            sel_rows = [emb_idx[s.id] for s in selected if emb_idx[s.id] is not None]
+            sel_matrix = matrix[sel_rows] if (matrix is not None and sel_rows) else None
+            for i, c in enumerate(candidates):
+                c_idx = emb_idx[c.id]
+                if c_idx is None or sel_matrix is None or len(sel_rows) == 0:
+                    # No usable embedding pair: degrade to relevance only
+                    score = MMR_LAMBDA * c.final_score
+                else:
+                    sims = sel_matrix @ matrix[c_idx]   # (k,)
+                    max_sim = float(sims.max()) if sims.size else 0.0
+                    if max_sim < 0.0:
+                        max_sim = 0.0
+                    score = MMR_LAMBDA * c.final_score - (1.0 - MMR_LAMBDA) * max_sim
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+            selected.append(candidates.pop(best_i))
+        return selected
 
     def _row_to_record(self, row: sqlite3.Row) -> MemoryRecord:
         keys = row.keys()
@@ -653,13 +900,26 @@ def _error(request_id: Any, code: int, message: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _IMPORT_EXTRACT_TMPL = (
-    "从以下对话片段中提取 0-5 条值得记忆的事实、偏好、承诺或重要事件。\n"
-    "每条记忆包含：key（简短标题）、content（具体内容）、"
-    "category（preference/promise/event/anniversary/emotion/habit/boundary/other 之一）、"
-    "importance（0.0~1.0）。\n"
-    "如果没有值得记忆的内容，返回空数组 []。\n"
-    "只输出纯 JSON 数组，不加任何说明：\n"
-    '[{{"key":"...","content":"...","category":"...","importance":0.7}}]\n\n'
+    "从以下对话片段中提取 1-3 条值得记忆的条目。\n"
+    "\n"
+    "**重要：鼓励连续叙事，反对碎片化**\n"
+    "- 把围绕同一主题/事件的细节**合并到一条 content 里**，保留时间顺序、因果关系、情感变化。\n"
+    "- 宁可少而完整，也不要拆成孤立的事实碎片。\n"
+    "- 反面示例（禁止）：拆成「去了公交站」「坐了 1ce 路」「到了 UTM」三条。\n"
+    "- 正面示例（推荐）：合并成「今天从家出门坐 1ce 路去 UTM，路上讨论了 X」一条完整叙事。\n"
+    "- content 可以较长（数百字无妨），优先完整性而非简洁。\n"
+    "- 只有真正**互不相关**的主题才应拆成多条（例如同一段对话里既聊了约会又聊了工作）。\n"
+    "\n"
+    "每条记忆包含：\n"
+    "- key：简短标题（≤20 字）\n"
+    "- content：完整叙事（可跨越多轮对话）\n"
+    "- category：preference / promise / event / anniversary / emotion / habit / boundary / other 之一\n"
+    "- importance：0.0~1.0\n"
+    "\n"
+    "如果本片段没有值得记忆的内容，返回空数组 []。\n"
+    "只输出纯 JSON 数组，不加任何说明、不加 markdown 代码块：\n"
+    '[{{"key":"...","content":"...","category":"...","importance":0.7}}]\n'
+    "\n"
     "对话片段：\n{chunk}"
 )
 
@@ -698,6 +958,7 @@ def _ensure_embed_pool(store: "MemoryStore") -> None:
                             (_pack_embedding(emb), mid),
                         )
                         store.conn.commit()
+                    store._mark_emb_dirty()
             except Exception as exc:
                 sys.stderr.write(f"[memory-mcp] embed worker error: {exc}\n")
             finally:
@@ -845,6 +1106,60 @@ def _start_import_task(store: "MemoryStore", path: Path) -> Dict[str, Any]:
     return task
 
 
+def _start_admin_task(
+    store: "MemoryStore",
+    kind: str,
+    runner_fn,
+    kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Generic launcher for reindex / consolidate. Registers a task in
+    _IMPORT_TASKS (reused — the front-end polls /import/status for any task),
+    kicks off a background thread, returns the initial task snapshot.
+    """
+    task_id = f"task_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{random.randint(100, 999)}"
+    task: Dict[str, Any] = {
+        "id": task_id,
+        "kind": kind,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": "",
+        "done": False,
+        "stage": "starting",
+        "processed": 0,
+        "total": 0,
+        "errors": [],
+    }
+    with _IMPORT_TASKS_LOCK:
+        _IMPORT_TASKS[task_id] = task
+
+    def progress_cb(state: Dict[str, Any]) -> None:
+        with _IMPORT_TASKS_LOCK:
+            # Overlay state onto the task dict — kind-specific fields land here too.
+            for k, v in state.items():
+                task[k] = v
+
+    def _runner() -> None:
+        try:
+            runner_fn(progress_cb=progress_cb, **kwargs)
+            # reindex creates new embeddings; consolidate creates new records
+            # (with empty embedding but still db rows) — either way, invalidate.
+            store._mark_emb_dirty()
+        except Exception as exc:
+            with _IMPORT_TASKS_LOCK:
+                task["errors"].append(f"fatal: {exc}")
+                task["stage"] = "error"
+            sys.stderr.write(f"[memory-mcp] admin task {task_id} ({kind}) fatal: {exc}\n")
+            sys.stderr.flush()
+        finally:
+            with _IMPORT_TASKS_LOCK:
+                task["done"] = True
+                task["finished_at"] = datetime.now(timezone.utc).isoformat()
+            sys.stderr.write(f"[memory-mcp] admin task {task_id} ({kind}) finished\n")
+            sys.stderr.flush()
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return task
+
+
 _IMPORT_HTML = """\
 <!DOCTYPE html>
 <html lang="zh">
@@ -903,9 +1218,18 @@ h1{color:var(--fg);font-size:28px;margin-bottom:6px}
 </style>
 </head>
 <body>
-<h1>Memory Import</h1>
-<p class="sub">导入对话记录，自动提取记忆碎片</p>
+<h1>Memory Admin</h1>
+<p class="sub">导入 · 维护 · 监控</p>
+
+<div class="card" style="margin-bottom:18px;padding:18px 22px">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap">
+    <div id="statsBlock" style="font-family:monospace;font-size:13px;line-height:1.8;color:var(--label)">loading…</div>
+    <div style="font-size:12px;color:var(--formats)">每 5s 刷新</div>
+  </div>
+</div>
+
 <div class="card">
+  <h2 style="font-size:16px;margin-bottom:14px;color:var(--fg)">导入对话</h2>
   <div class="drop-zone" id="dropZone">
     <input type="file" id="fileInput" accept=".json,.md,.txt">
     <div class="drop-label">
@@ -925,6 +1249,15 @@ h1{color:var(--fg);font-size:28px;margin-bottom:6px}
       <span style="color:var(--formats);font-size:12px">支持 Claude 官方导出 / 插件导出 / ChatGPT mapping</span>
     </div>
   </div>
+  <div style="margin-top:22px;display:flex;align-items:center;gap:10px">
+    <span style="color:var(--sub);font-size:12px">维护操作</span>
+    <span style="flex:1;height:1px;background:var(--card-border)"></span>
+  </div>
+  <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+    <button id="btnReindex" style="padding:11px 18px;border:1px solid var(--card-border);border-radius:8px;background:var(--card-bg);color:var(--fg);cursor:pointer;font-size:13px">补齐 Embedding</button>
+    <button id="btnConsolidate" style="padding:11px 18px;border:1px solid var(--card-border);border-radius:8px;background:var(--card-bg);color:var(--fg);cursor:pointer;font-size:13px">合并 Session</button>
+    <span id="consolidateHint" style="color:var(--formats);font-size:12px;align-self:center"></span>
+  </div>
   <div id="statusSection">
     <div class="prog-bar"><div class="prog-fill" id="progFill"></div></div>
     <div id="statusLine" style="font-family:monospace;font-size:13px;color:var(--label);margin-bottom:10px"></div>
@@ -938,7 +1271,42 @@ const ss=document.getElementById('statusSection'),logEl=document.getElementById(
 const pf=document.getElementById('progFill'),ra=document.getElementById('resultArea');
 const pathIn=document.getElementById('pathInput'),pathBtn=document.getElementById('pathSubmit');
 const stLine=document.getElementById('statusLine');
+const statsBlock=document.getElementById('statsBlock');
+const btnReindex=document.getElementById('btnReindex'),btnConsolidate=document.getElementById('btnConsolidate');
+const consolidateHint=document.getElementById('consolidateHint');
 const SIZE_LIMIT=30*1024*1024;
+
+async function refreshStats(){
+  try{
+    const r=await fetch('/stats');const s=await r.json();
+    const cov=(s.embedding_coverage*100).toFixed(1);
+    const activeLine=s.active_tasks.length
+      ? s.active_tasks.map(t=>`${t.kind} ${t.processed}/${t.total||'?'}`).join(' · ')
+      : '空闲';
+    statsBlock.innerHTML=
+      `记忆总数: <b>${s.long_term_count}</b> · `+
+      `embedding: <b>${s.with_embedding}</b> (${cov}%) · `+
+      `缺 embedding: <b>${s.missing_embedding}</b><br>`+
+      `未合并 session (≥5 条): <b>${s.unconsolidated_sessions_over_5}</b> · `+
+      `pinned: <b>${s.pinned_count}</b><br>`+
+      `活跃任务: ${activeLine}`;
+    btnReindex.disabled=s.missing_embedding===0;
+    btnReindex.style.opacity=btnReindex.disabled?'0.4':'1';
+    if(!s.openrouter_key_present){
+      btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
+      consolidateHint.textContent='未检测到 OPENROUTER_API_KEY（.env 未配置或需重启 server）';
+    }else if(s.unconsolidated_sessions_over_5===0){
+      btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
+      consolidateHint.textContent='没有待合并的 session';
+    }else{
+      btnConsolidate.disabled=false;btnConsolidate.style.opacity='1';
+      consolidateHint.textContent='';
+    }
+  }catch(e){
+    statsBlock.textContent='stats 加载失败: '+e.message;
+  }
+}
+refreshStats();setInterval(refreshStats,5000);
 dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('over')});
 dz.addEventListener('dragleave',()=>dz.classList.remove('over'));
 dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('over');if(e.dataTransfer.files[0])run(e.dataTransfer.files[0])});
@@ -972,6 +1340,66 @@ async function run(file){
     setP(100);renderSync(data);
   }catch(e){setP(0);addLog('请求失败: '+e.message,'err')}
 }
+async function startAdminTask(kind, body){
+  resetUI();setP(3);
+  addLog('启动 '+kind+' 任务…');
+  try{
+    const resp=await fetch('/admin/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+    const data=await resp.json();
+    if(!data.ok){addLog('启动失败: '+(data.error||'未知'),'err');return}
+    addLog('任务 '+data.task_id+' 启动','ok');
+    await pollAdminTask(data.task_id,kind);
+    refreshStats();
+  }catch(e){addLog('请求失败: '+e.message,'err')}
+}
+async function pollAdminTask(taskId,kind){
+  while(true){
+    await new Promise(r=>setTimeout(r,2000));
+    let s;
+    try{const r=await fetch('/import/status?task_id='+encodeURIComponent(taskId));s=await r.json()}
+    catch(e){addLog('状态查询失败: '+e.message,'err');continue}
+    if(s.error){addLog('任务错误: '+s.error,'err');return}
+    const tot=Math.max(1,s.total||1);
+    const proc=s.processed||0;
+    setP(Math.round(100*proc/tot));
+    const bits=['['+proc+'/'+(s.total||0)+']'];
+    if(s.success!=null)bits.push('ok='+s.success);
+    if(s.failed)bits.push('fail='+s.failed);
+    if(s.skipped)bits.push('skip='+s.skipped);
+    if(s.records_out!=null)bits.push('records='+s.records_out);
+    if(s.rate_per_s)bits.push(s.rate_per_s.toFixed(2)+'/s');
+    if(s.eta_min)bits.push('ETA '+s.eta_min.toFixed(1)+'min');
+    setStatus(bits.join(' · '));
+    if(s.done){
+      setP(100);
+      const tag=s.aborted?'任务中止':'任务完成';
+      addLog(tag,s.aborted?'err':'ok');
+      const extra=kind==='consolidate' && s.records_out
+        ? '<br><span style="color:var(--sub);font-size:12px">提示：新合并记忆 embedding 留空，可以再跑一次「补齐 Embedding」</span>'
+        : '';
+      ra.innerHTML='<div class="result-box"><h3>'+tag+'</h3><p>'+
+        '处理：<span class="num">'+(s.processed||0)+'</span><br>'+
+        '成功：<span class="num">'+(s.success||0)+'</span> · 失败：<span class="num">'+(s.failed||0)+'</span>'+
+        (s.records_out!=null?'<br>新建记忆：<span class="num">'+s.records_out+'</span>':'')+
+        (s.aborted_reason?'<br><span style="color:#ef4444">'+s.aborted_reason+'</span>':'')+
+        extra+
+      '</p></div>';
+      return;
+    }
+  }
+}
+btnReindex.addEventListener('click',()=>{
+  if(!confirm('启动 embedding 补齐任务？会占用 ollama/bge-m3。')) return;
+  startAdminTask('reindex',{workers:4,batch:50});
+});
+btnConsolidate.addEventListener('click',()=>{
+  const maxFrag=prompt('只合并碎片数 ≤ N 的 session（留空=全部；建议第一次填 49 先跑短中 session）：','49');
+  if(maxFrag===null)return;
+  const n=parseInt(maxFrag)||0;
+  if(!confirm('启动 session 合并任务？将调用 OpenRouter（Gemini 3.1 Flash Lite），预计成本 $1-6。')) return;
+  startAdminTask('consolidate',{min_fragments:5,max_fragments:n,workers:2});
+});
+
 async function runPath(path){
   resetUI();setP(3);
   addLog('提交服务器路径: '+path);
@@ -999,9 +1427,41 @@ async function pollTask(taskId){
     if(s.processed!==lastProcessed){lastProcessed=s.processed}
     if(s.done){
       setP(100);
-      addLog('任务完成','ok');
-      ra.innerHTML='<div class="result-box"><h3>导入完成</h3><p>格式：<span class="num">'+s.format+'</span><br>对话数：<span class="num">'+s.total+'</span><br>创建记忆：<span class="num">'+s.created+'</span><br>跳过空对话：<span class="num">'+s.skipped+'</span><br>错误：<span class="num">'+(s.errors||[]).length+'</span></p></div>';
+      addLog('LLM 提取完成，切换到 embedding 阶段','ok');
+      ra.innerHTML='<div class="result-box"><h3>提取完成</h3><p>格式：<span class="num">'+s.format+'</span><br>对话数：<span class="num">'+s.total+'</span><br>创建记忆：<span class="num">'+s.created+'</span><br>跳过空对话：<span class="num">'+s.skipped+'</span><br>错误：<span class="num">'+(s.errors||[]).length+'</span></p></div>';
+      await pollEmbedStatus();
       return;
+    }
+  }
+}
+async function pollEmbedStatus(){
+  let maxPending=0;
+  let stableZeroCount=0;
+  while(true){
+    await new Promise(r=>setTimeout(r,2500));
+    let s;
+    try{const r=await fetch('/import/embed_status');s=await r.json()}
+    catch(e){addLog('embed status 查询失败: '+e.message,'err');continue}
+    const pending=s.pending|0;
+    if(pending>maxPending) maxPending=pending;
+    const done=Math.max(0,maxPending-pending);
+    const pct=maxPending>0?Math.round(100*done/maxPending):100;
+    setP(pct);
+    if(maxPending===0){
+      setStatus('embedding 队列已空，无待处理');
+    }else{
+      setStatus('Embedding 后台生成中：'+done+' / '+maxPending+'（剩余 '+pending+'）');
+    }
+    if(pending===0){
+      stableZeroCount++;
+      // 连续两次为 0 才确认完成（避免瞬时空 queue 但还有 task 没塞完）
+      if(stableZeroCount>=2){
+        addLog('全部 embedding 已生成 ✓','ok');
+        setStatus('全部完成');
+        return;
+      }
+    }else{
+      stableZeroCount=0;
     }
   }
 }
@@ -1143,23 +1603,43 @@ TOOLS = [
     },
     {
         "name": "extmcp_search_memory",
-        "description": "Search memories using hybrid keyword + vector search. Automatically generates bge-m3 embedding for the query. Returns valence, arousal, pinned, and decay_score for each result.",
+        "description": (
+            "Hybrid keyword (BM25) + vector (bge-m3 cosine) search over the memory store. "
+            "Returns full content, valence, arousal, pinned, and decay_score per hit. "
+            "Hits are touched (activation_count +1) as a side effect. "
+            "Tune `limit` yourself to match the task: 3-5 for precise lookup, 8 (default) "
+            "for general recall, up to 40 for broad exploration. "
+            "Context usage scales roughly linearly with `limit` — don't grab 40 when you need 5."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
-                "limit": {"type": "integer", "description": "Max results (default 8)"},
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results, 1-40 (default 8). Caller decides based on task scope.",
+                },
             },
             "required": ["query"],
         },
     },
     {
         "name": "extmcp_list_memories",
-        "description": "List recent memories ordered by last update time. Returns valence, arousal, pinned, and decay_score for each record.",
+        "description": (
+            "List recent memories ordered by updated_at desc. "
+            "By default returns metadata only (id/key/category/updated_at/decay_score/pinned) "
+            "— full content is omitted to keep responses small on large memory stores. "
+            "Pass `full=true` to include content + importance + valence + arousal. "
+            "Use search to retrieve specific records by topic."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "limit": {"type": "integer", "description": "Max results (default 20)"},
+                "limit": {"type": "integer", "description": "Max results, 1-100 (default 20)"},
+                "full": {
+                    "type": "boolean",
+                    "description": "Include full content and emotion fields (default false)",
+                },
             },
         },
     },
@@ -1244,6 +1724,23 @@ TOOLS = [
         },
     },
     {
+        "name": "extmcp_recall_session",
+        "description": (
+            "拿到一个 session（通常是一次对话）的所有记忆碎片，按 created_at 升序——"
+            "用于**重建事件的完整时间轴**。"
+            "批量导入的对话常被 LLM 提取成多条独立记忆（一次约会可能被拆成「出门」「到达」「聊天」），"
+            "search 命中其中一条后，用这个工具拉出完整 session，就能还原原始叙事顺序和上下文。"
+            "输入 session_id（可从 search/list/breath 的结果里拿）。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "要召回的 session 标识"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
         "name": "extmcp_breath",
         "description": (
             "主动呼吸：浮现当前权重最高的未解决记忆 + pinned 核心。"
@@ -1320,6 +1817,8 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                         tuple(params),
                     )
                     store.conn.commit()
+                if emb:
+                    store._mark_emb_dirty()
 
         threading.Thread(target=_bg_update, args=(memory_id, content, do_emotion), daemon=True).start()
 
@@ -1337,7 +1836,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         query = str(args.get("query", "")).strip()
         if not query:
             raise ValueError("query is required")
-        limit = max(1, min(20, int(args.get("limit", 8) or 8)))
+        limit = max(1, min(40, int(args.get("limit", 8) or 8)))
         query_embedding = _call_ollama_embedding(query) or None
         results = store.search(query, query_embedding=query_embedding, limit=limit)
         for r in results:
@@ -1346,30 +1845,65 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             {
                 "id": r.id, "key": r.key, "content": r.content,
                 "category": r.category, "importance": r.importance,
+                "session_id": r.session_id,
                 "score": round(r.final_score, 4),
                 "valence": r.valence, "arousal": r.arousal,
                 "pinned": r.pinned, "decay_score": _calc_decay_score(r),
             }
             for r in results
         ]
-        return [{"type": "text", "text": json.dumps(
-            {"query": query, "count": len(items), "items": items}, ensure_ascii=False
-        )}]
+        # Aggregate hits by session_id — signals to the caller which sessions
+        # have multiple fragments and are worth recalling in full via
+        # extmcp_recall_session to reconstruct the original narrative.
+        session_agg: Dict[str, Dict[str, Any]] = {}
+        for r in results:
+            sid = r.session_id or "(no session)"
+            bucket = session_agg.setdefault(sid, {"hit_count": 0, "ids": []})
+            bucket["hit_count"] += 1
+            bucket["ids"].append(r.id)
+        multi_hit = {k: v for k, v in session_agg.items() if v["hit_count"] >= 2}
+        return [{"type": "text", "text": json.dumps({
+            "query": query,
+            "count": len(items),
+            "items": items,
+            "multi_hit_sessions": multi_hit,
+            "hint": (
+                "相同 session_id 的多条命中通常来自同一对话被拆成的碎片；"
+                "用 extmcp_recall_session(session_id) 可以拉出完整时间轴。"
+                if multi_hit else ""
+            ),
+        }, ensure_ascii=False)}]
 
     elif name == "extmcp_list_memories":
         limit = max(1, min(100, int(args.get("limit", 20) or 20)))
+        full = bool(args.get("full", False))
         results = store.list_memories(limit=limit)
-        items = [
-            {
-                "id": r.id, "key": r.key, "content": r.content,
-                "category": r.category, "importance": r.importance,
-                "updated_at": r.updated_at,
-                "valence": r.valence, "arousal": r.arousal,
-                "pinned": r.pinned, "decay_score": _calc_decay_score(r),
-            }
-            for r in results
-        ]
-        return [{"type": "text", "text": json.dumps({"count": len(items), "items": items}, ensure_ascii=False)}]
+        if full:
+            items = [
+                {
+                    "id": r.id, "key": r.key, "content": r.content,
+                    "category": r.category, "importance": r.importance,
+                    "updated_at": r.updated_at,
+                    "valence": r.valence, "arousal": r.arousal,
+                    "pinned": r.pinned, "decay_score": _calc_decay_score(r),
+                }
+                for r in results
+            ]
+        else:
+            # Metadata-only: keeps response small on large stores (35k+).
+            # Caller can re-query specific items via search or pass full=true.
+            items = [
+                {
+                    "id": r.id, "key": r.key, "category": r.category,
+                    "updated_at": r.updated_at,
+                    "decay_score": _calc_decay_score(r),
+                    "pinned": r.pinned,
+                }
+                for r in results
+            ]
+        return [{"type": "text", "text": json.dumps(
+            {"count": len(items), "full": full, "items": items}, ensure_ascii=False,
+        )}]
 
     elif name == "extmcp_delete_memory":
         memory_id = str(args.get("id", "")).strip()
@@ -1565,8 +2099,8 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
 
         lines.append(
             "---\n"
-            "💡 用 `extmcp_save_memory` 传 `resolved=true` 或 `digested=true` 可大幅降低衰减权重。\n"
-            "💡 用 `extmcp_save_memory` 传 `pinned=true` 可将记忆永久置顶（decay_score=999）。"
+            "- 用 `extmcp_save_memory` 传 `resolved=true` 或 `digested=true` 可大幅降低衰减权重。\n"
+            "- 用 `extmcp_save_memory` 传 `pinned=true` 可将记忆永久置顶（decay_score=999）。"
         )
         return [{"type": "text", "text": "\n".join(lines)}]
 
@@ -1594,6 +2128,8 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                         (_pack_embedding(emb), v, a, mid),
                     )
                     store.conn.commit()
+                if emb:
+                    store._mark_emb_dirty()
 
             threading.Thread(target=_bg_short, args=(memory_id, content), daemon=True).start()
             return [{"type": "text", "text": json.dumps(
@@ -1653,6 +2189,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                             (_pack_embedding(emb), mid),
                         )
                         store.conn.commit()
+                    store._mark_emb_dirty()
 
             threading.Thread(target=_bg_emb, args=(memory_id, item_content), daemon=True).start()
 
@@ -1660,6 +2197,36 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             {"ok": True, "mode": "split", "count": len(saved_ids), "ids": saved_ids},
             ensure_ascii=False,
         )}]
+
+    elif name == "extmcp_recall_session":
+        session_id = str(args.get("session_id", "")).strip()
+        if not session_id:
+            raise ValueError("session_id is required")
+        with store._lock:
+            rows = store.conn.execute(
+                "SELECT * FROM memories WHERE session_id = ? ORDER BY created_at ASC",
+                (session_id,),
+            ).fetchall()
+        recs = [store._row_to_record(r) for r in rows]
+        items = [
+            {
+                "id": r.id, "key": r.key, "content": r.content,
+                "category": r.category, "importance": r.importance,
+                "created_at": r.created_at,
+                "valence": r.valence, "arousal": r.arousal,
+                "pinned": r.pinned, "resolved": r.resolved,
+            }
+            for r in recs
+        ]
+        span = ""
+        if items:
+            span = f"{items[0]['created_at']} → {items[-1]['created_at']}"
+        return [{"type": "text", "text": json.dumps({
+            "session_id": session_id,
+            "count": len(items),
+            "time_span": span,
+            "items": items,
+        }, ensure_ascii=False)}]
 
     elif name == "extmcp_breath":
         limit = max(1, min(20, int(args.get("limit", 10) or 10)))
@@ -1949,6 +2516,109 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 return
             self._send_json(200, snapshot)
 
+        def _handle_embed_status(self) -> None:
+            """GET /import/embed_status — global embedding queue depth.
+
+            UI tracks the high-water mark client-side to render a progress bar
+            for the post-extraction phase (when LLM extraction is done but
+            bge-m3 is still chewing through the backlog).
+            """
+            self._send_json(200, {"pending": _IMPORT_EMBED_QUEUE.qsize()})
+
+        # ---- Admin: DB stats + maintenance tasks ----
+
+        def _handle_stats(self) -> None:
+            """GET /stats — quick db rollup for the admin panel header."""
+            with store._lock:
+                long_term = store.conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE memory_kind='long_term'"
+                ).fetchone()[0]
+                with_emb = store.conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE memory_kind='long_term' AND length(embedding) > 0"
+                ).fetchone()[0]
+                pinned = store.conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE pinned=1 AND memory_kind='long_term'"
+                ).fetchone()[0]
+                missing_emb = store.conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE memory_kind='long_term' AND length(embedding) = 0"
+                ).fetchone()[0]
+                unconsolidated_sessions = store.conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT session_id FROM memories"
+                    "  WHERE session_id != '' AND digested = 0 AND consolidated = 0"
+                    "  AND memory_kind='long_term'"
+                    "  GROUP BY session_id HAVING COUNT(*) >= 5"
+                    ")"
+                ).fetchone()[0]
+
+            with _IMPORT_TASKS_LOCK:
+                active = [
+                    {
+                        "id": t["id"], "kind": t.get("kind", "import"),
+                        "done": t.get("done", False), "stage": t.get("stage", ""),
+                        "processed": t.get("processed", 0), "total": t.get("total", 0),
+                    }
+                    for t in _IMPORT_TASKS.values() if not t.get("done")
+                ]
+
+            self._send_json(200, {
+                "long_term_count": long_term,
+                "with_embedding": with_emb,
+                "embedding_coverage": round(with_emb / long_term, 4) if long_term else 0.0,
+                "missing_embedding": missing_emb,
+                "unconsolidated_sessions_over_5": unconsolidated_sessions,
+                "pinned_count": pinned,
+                "active_tasks": active,
+                "openrouter_key_present": bool(os.environ.get("OPENROUTER_API_KEY")),
+            })
+
+        def _handle_admin_reindex(self) -> None:
+            """POST /admin/reindex — kick off reindex_embeddings in the background."""
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+            except json.JSONDecodeError:
+                data = {}
+
+            from reindex_embeddings import run_reindex
+            kwargs = {
+                "db_path": Path(store.db_path),
+                "workers": max(1, min(8, int(data.get("workers", 4) or 4))),
+                "batch": max(1, min(500, int(data.get("batch", 50) or 50))),
+                "limit": max(0, int(data.get("limit", 0) or 0)),
+            }
+            task = _start_admin_task(store, "reindex", run_reindex, kwargs)
+            self._send_json(200, {"ok": True, "async": True, "task_id": task["id"]})
+
+        def _handle_admin_consolidate(self) -> None:
+            """POST /admin/consolidate — kick off consolidate_sessions in the background."""
+            if not os.environ.get("OPENROUTER_API_KEY"):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "OPENROUTER_API_KEY not set. Add it to .env (next to memory.db) and restart the server.",
+                })
+                return
+
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+            except json.JSONDecodeError:
+                data = {}
+
+            from consolidate_sessions import run_consolidate
+            kwargs = {
+                "db_path": Path(store.db_path),
+                "min_fragments": max(2, int(data.get("min_fragments", 5) or 5)),
+                "max_fragments": max(0, int(data.get("max_fragments", 0) or 0)),
+                "workers": max(1, min(4, int(data.get("workers", 2) or 2))),
+                "limit": max(0, int(data.get("limit", 0) or 0)),
+                "dry_run": bool(data.get("dry_run", False)),
+            }
+            task = _start_admin_task(store, "consolidate", run_consolidate, kwargs)
+            self._send_json(200, {"ok": True, "async": True, "task_id": task["id"]})
+
         def _handle_import_post(self) -> None:
             import time as _time
             content_type = self.headers.get("Content-Type", "")
@@ -2105,6 +2775,10 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_mcp_post()
             elif path == "/import":
                 self._handle_import_post()
+            elif path == "/admin/reindex":
+                self._handle_admin_reindex()
+            elif path == "/admin/consolidate":
+                self._handle_admin_consolidate()
             else:
                 self._handle_legacy_post()
 
@@ -2118,6 +2792,10 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_import_get()
             elif path == "/import/status":
                 self._handle_import_status()
+            elif path == "/import/embed_status":
+                self._handle_embed_status()
+            elif path == "/stats":
+                self._handle_stats()
             else:
                 info = json.dumps({
                     "name": "memory-mcp",
@@ -2223,7 +2901,13 @@ def main() -> None:
     OLLAMA_TIMEOUT = args.ollama_timeout
     SUMMARIZE_DRY_RUN = args.dry_run
 
-    store = MemoryStore(Path(args.db).resolve())
+    db_path = Path(args.db).resolve()
+    # Load .env sitting next to the db (or the script if db is elsewhere).
+    # Populates OPENROUTER_API_KEY etc. for the consolidate path.
+    _load_dotenv(db_path.parent)
+    _load_dotenv(Path(__file__).parent)
+
+    store = MemoryStore(db_path)
 
     if args.http:
         _run_http(store, args.host, args.port)

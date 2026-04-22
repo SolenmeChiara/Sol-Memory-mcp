@@ -79,13 +79,26 @@ def _pack_embedding(values: List[float]) -> bytes:
 # ---------------------------------------------------------------------------
 
 _IMPORT_EXTRACT_TMPL = (
-    "从以下对话片段中提取 0-5 条值得记忆的事实、偏好、承诺或重要事件。\n"
-    "每条记忆包含：key（简短标题）、content（具体内容）、"
-    "category（preference/promise/event/anniversary/emotion/habit/boundary/other 之一）、"
-    "importance（0.0~1.0）。\n"
-    "如果没有值得记忆的内容，返回空数组 []。\n"
-    "只输出纯 JSON 数组，不加任何说明：\n"
-    '[{{"key":"...","content":"...","category":"...","importance":0.7}}]\n\n'
+    "从以下对话片段中提取 1-3 条值得记忆的条目。\n"
+    "\n"
+    "**重要：鼓励连续叙事，反对碎片化**\n"
+    "- 把围绕同一主题/事件的细节**合并到一条 content 里**，保留时间顺序、因果关系、情感变化。\n"
+    "- 宁可少而完整，也不要拆成孤立的事实碎片。\n"
+    "- 反面示例（禁止）：拆成「去了公交站」「坐了 1ce 路」「到了 UTM」三条。\n"
+    "- 正面示例（推荐）：合并成「今天从家出门坐 1ce 路去 UTM，路上讨论了 X」一条完整叙事。\n"
+    "- content 可以较长（数百字无妨），优先完整性而非简洁。\n"
+    "- 只有真正**互不相关**的主题才应拆成多条（例如同一段对话里既聊了约会又聊了工作）。\n"
+    "\n"
+    "每条记忆包含：\n"
+    "- key：简短标题（≤20 字）\n"
+    "- content：完整叙事（可跨越多轮对话）\n"
+    "- category：preference / promise / event / anniversary / emotion / habit / boundary / other 之一\n"
+    "- importance：0.0~1.0\n"
+    "\n"
+    "如果本片段没有值得记忆的内容，返回空数组 []。\n"
+    "只输出纯 JSON 数组，不加任何说明、不加 markdown 代码块：\n"
+    '[{{"key":"...","content":"...","category":"...","importance":0.7}}]\n'
+    "\n"
     "对话片段：\n{chunk}"
 )
 

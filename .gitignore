@@ -4,6 +4,7 @@
 *.sqlite
 .env
 .claude/settings.local.json
+.claude/worktrees/
 *.key
 config.yaml
 config.json
