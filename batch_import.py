@@ -3,6 +3,7 @@
 
 Usage:
     python batch_import.py "path/to/export.json" [--db memory.db] [--start 0] [--limit 10] [--dry-run]
+    python batch_import.py export.zip --provider gemini --model gemini-2.0-flash-lite
 """
 from __future__ import annotations
 
@@ -16,10 +17,14 @@ import sqlite3
 import struct
 import sys
 import threading
+import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # Ollama configuration
@@ -32,13 +37,55 @@ OLLAMA_TIMEOUT: float = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
 N_EMBED_WORKERS = 2
 
 # ---------------------------------------------------------------------------
+# Gemini configuration
+# ---------------------------------------------------------------------------
+
+GEMINI_DEFAULT_MODEL = "gemini-flash-lite-latest"
+GEMINI_TIMEOUT: float = float(os.environ.get("GEMINI_TIMEOUT", "180"))
+# 8192 leaves enough headroom for thinking models (gemini-3.5-flash, gemini-3-*)
+# to reason AND still emit a multi-memory JSON array. Non-thinking lite models
+# stop well below this cap on their own.
+GEMINI_MAX_OUTPUT_TOKENS = 8192
+
+# Session-mode chunking. Gemini handles 1M-token context so we treat each
+# conversation as a single chunk; only split if total chars exceed this.
+SESSION_HARD_CHUNK_CHARS = 100_000
+
+
+def _load_env_var(name: str) -> Optional[str]:
+    """Look in process env first, then nearby .env files (script dir up 3 levels)."""
+    val = os.environ.get(name)
+    if val:
+        return val.strip()
+    for path in [
+        SCRIPT_DIR / ".env",
+        SCRIPT_DIR.parent / ".env",
+        SCRIPT_DIR.parent.parent / ".env",
+        SCRIPT_DIR.parent.parent.parent / ".env",
+    ]:
+        if not path.is_file():
+            continue
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("set "):
+                line = line[4:].lstrip()
+            if "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() == name:
+                return v.strip().strip('"').strip("'")
+    return None
+
+# ---------------------------------------------------------------------------
 # Ollama helpers (logic from memory_mcp.py)
 # ---------------------------------------------------------------------------
 
-def _call_ollama(prompt: str) -> str:
+def _call_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
     url = f"{OLLAMA_BASE_URL.rstrip('/')}/v1/chat/completions"
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "temperature": 0.3,
@@ -50,6 +97,69 @@ def _call_ollama(prompt: str) -> str:
     with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
         body = resp.read().decode("utf-8", errors="replace")
     return json.loads(body)["choices"][0]["message"]["content"]
+
+
+def _call_gemini(prompt: str, api_key: str, model: str = GEMINI_DEFAULT_MODEL) -> str:
+    """Call Google AI Studio's Gemini generateContent endpoint.
+
+    Returns the model's text response (single candidate). Raises RuntimeError
+    on safety blocks / empty outputs so the caller can log + continue.
+    """
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
+        f":generateContent?key={api_key}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+            "temperature": 0.3,
+        },
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"Gemini HTTP {e.code}: {raw}") from None
+
+    parsed = json.loads(body)
+    candidates = parsed.get("candidates") or []
+    if not candidates:
+        # Could be a top-level promptFeedback.blockReason
+        feedback = parsed.get("promptFeedback") or {}
+        raise RuntimeError(f"Gemini returned no candidates: {feedback}")
+    cand = candidates[0]
+    finish_reason = cand.get("finishReason")
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+    if not text:
+        # Thinking models can exhaust the output budget on internal reasoning
+        # and emit zero content parts. Surface that distinctly so the caller
+        # knows to raise maxOutputTokens or set thinkingConfig.thinkingBudget=0.
+        if finish_reason == "MAX_TOKENS":
+            usage = parsed.get("usageMetadata") or {}
+            think_tok = usage.get("thoughtsTokenCount", "?")
+            raise RuntimeError(
+                f"Gemini MAX_TOKENS with empty content — thinking ate the budget "
+                f"(thoughtsTokens={think_tok}, max={GEMINI_MAX_OUTPUT_TOKENS}). "
+                f"Bump GEMINI_MAX_OUTPUT_TOKENS or disable thinking."
+            )
+        raise RuntimeError(f"Gemini returned empty text (finishReason={finish_reason})")
+    return text
+
+
+def _call_llm(provider: str, prompt: str, model: str, api_key: Optional[str]) -> str:
+    """Provider dispatcher: route to Gemini or Ollama based on `provider`."""
+    if provider == "gemini":
+        if not api_key:
+            raise RuntimeError("GOOGLE_AI_STUDIO_KEY not set (env or .env)")
+        return _call_gemini(prompt, api_key, model)
+    return _call_ollama(prompt, model)
 
 
 def _call_ollama_embedding(text: str) -> List[float]:
@@ -77,6 +187,37 @@ def _pack_embedding(values: List[float]) -> bytes:
 # ---------------------------------------------------------------------------
 # Prompt template and text helpers (from memory_mcp.py)
 # ---------------------------------------------------------------------------
+
+_SESSION_EXTRACT_TMPL = """你是一位温和细致的记忆管理者。你对经手的每一段记忆都带着安心感和珍视，像是在整理一本私人日记。
+
+你的性格决定了你的工作方式：
+- 你实事求是，从不在笔记中添加不客观的新内容。对话里说了什么就记什么，没说的绝不臆造。
+- 你尊重完整性。一件事的来龙去脉不会被你拆散，相关的细节你会自然地归拢在一起。
+- 你有分寸感。闲聊、调试代码、重复的问答，你会安静地略过，只留下真正有温度或有份量的东西。
+- 你对情感很敏感。记录时你会自然地感受到这段对话的情绪色彩，并如实标注。
+- 你惜字但不吝啬。每条记忆 50-300 字，足够还原现场，又不至于啰嗦。
+
+现在请整理以下对话，提取出值得长期珍藏的记忆。一段对话通常整理出 1-8 条记忆，视内容丰富程度而定。
+
+输出格式（纯 JSON 数组，不要加任何额外说明）：
+[
+  {{
+    "key": "简短标题（15字以内）",
+    "content": "完整的事件或主题描述",
+    "category": "preference|promise|event|anniversary|emotion|habit|boundary|other",
+    "importance": 0.5,
+    "valence": 0.7,
+    "arousal": 0.4
+  }}
+]
+
+importance: 0.0-1.0，日常琐事 0.2-0.4，重要事件 0.6-0.8，核心记忆 0.9-1.0
+valence: 0.0（极度消极）到 1.0（极度积极），0.5 为中性
+arousal: 0.0（非常平静）到 1.0（非常激动），0.3 为日常状态
+
+对话记录：
+{chunk}"""
+
 
 _IMPORT_EXTRACT_TMPL = (
     "从以下对话片段中提取 1-3 条值得记忆的条目。\n"
@@ -191,14 +332,50 @@ def _quick_count(data: Any) -> int:
     return 0
 
 
-def _conv_to_text(conv: Dict[str, Any]) -> Tuple[str, str]:
-    """Return (title, plain_text) for one conversation dict."""
+def _normalize_iso_ts(raw: Any) -> Optional[str]:
+    """Coerce a Claude/ChatGPT export timestamp into the project's ISO+UTC form
+    (e.g. `2026-05-07T20:10:10.126945+00:00`). Returns None if it can't parse.
+    Accepts `...Z`, `...+00:00`, naive ISO, or a unix epoch number."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    return None
+
+
+def _conv_to_text(conv: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
+    """Return (title, plain_text, original_ts_iso) for one conversation dict.
+
+    The third item is the conversation's own created_at (when available)
+    normalised to ISO-8601 with UTC offset — used as the memory's
+    `created_at` so imported history retains its original timeline.
+    """
     parts: List[str] = []
     title = ""
+    original_ts: Optional[str] = None
 
     if "chat_messages" in conv:
         # Claude official bulk export
         title = str(conv.get("name", "") or "")
+        original_ts = (
+            _normalize_iso_ts(conv.get("created_at"))
+            or (_normalize_iso_ts(conv.get("chat_messages", [{}])[0].get("created_at"))
+                if conv.get("chat_messages") else None)
+        )
         if title:
             parts.append(f"--- 对话：{title} ---")
         for msg in conv.get("chat_messages", []):
@@ -220,6 +397,12 @@ def _conv_to_text(conv: Dict[str, Any]) -> Tuple[str, str]:
             or conv.get("title", "")
             or ""
         )
+        original_ts = (
+            _normalize_iso_ts(conv.get("created_at"))
+            or _normalize_iso_ts(conv.get("create_time"))
+            or (isinstance(meta, dict) and _normalize_iso_ts(meta.get("created_at")))
+            or None
+        )
         if title:
             parts.append(f"--- 对话：{title} ---")
         for m in conv.get("messages", []):
@@ -237,6 +420,10 @@ def _conv_to_text(conv: Dict[str, Any]) -> Tuple[str, str]:
     elif "mapping" in conv:
         # ChatGPT conversation
         title = str(conv.get("title", "") or "")
+        original_ts = (
+            _normalize_iso_ts(conv.get("create_time"))
+            or _normalize_iso_ts(conv.get("created_at"))
+        )
         if title:
             parts.append(f"--- 对话：{title} ---")
         mapping: Dict[str, Any] = conv.get("mapping", {})
@@ -268,7 +455,7 @@ def _conv_to_text(conv: Dict[str, Any]) -> Tuple[str, str]:
             children = node.get("children", [])
             current_id = children[0] if children else None
 
-    return title, "\n".join(parts)
+    return title, "\n".join(parts), original_ts
 
 
 # ---------------------------------------------------------------------------
@@ -339,18 +526,28 @@ def insert_memory(
     category: str = "other",
     importance: float = 0.5,
     session_id: str = "",
+    created_at_override: Optional[str] = None,
+    valence: float = 0.5,
+    arousal: float = 0.3,
 ) -> None:
+    """Insert one memory. If `created_at_override` is provided (ISO UTC string),
+    use it for both `created_at` and `updated_at`; otherwise default to now."""
     now = datetime.now(timezone.utc).isoformat()
+    created_at = created_at_override or now
+    updated_at = created_at_override or now
+    val = max(0.0, min(1.0, float(valence)))
+    aro = max(0.0, min(1.0, float(arousal)))
     with _DB_LOCK:
         conn.execute(
             """
             INSERT INTO memories(id, key, content, memory_kind, category, importance, session_id,
                                  created_at, updated_at, embedding,
                                  valence, arousal, pinned, resolved, digested, activation_count, last_active)
-            VALUES (?, ?, ?, 'long_term', ?, ?, ?, ?, ?, X'', 0.5, 0.3, 0, 0, 0, 1.0, ?)
+            VALUES (?, ?, ?, 'long_term', ?, ?, ?, ?, ?, X'', ?, ?, 0, 0, 0, 1.0, ?)
             ON CONFLICT(id) DO NOTHING
             """,
-            (memory_id, key, content, category, importance, session_id, now, now, now),
+            (memory_id, key, content, category, importance, session_id,
+             created_at, updated_at, val, aro, now),
         )
         conn.commit()
 
@@ -409,7 +606,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Batch import conversation exports into the memory SQLite database"
     )
-    parser.add_argument("file", help="Path to the JSON export file")
+    parser.add_argument("file", help="Path to the JSON or .zip export file")
     parser.add_argument("--db", default="memory.db", help="SQLite database path (default: ./memory.db)")
     parser.add_argument(
         "--start", type=int, default=0,
@@ -421,9 +618,38 @@ def main() -> None:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Parse and chunk only — no LLM calls, no DB writes",
+        help="Call LLM and show what would be inserted, but skip all DB writes",
+    )
+    parser.add_argument(
+        "--provider", choices=["ollama", "gemini"], default="ollama",
+        help="LLM backend for extraction (default: ollama)",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Model name. Default: gemma4:e4b (ollama) or gemini-2.0-flash-lite (gemini)",
+    )
+    parser.add_argument(
+        "--session-mode", action=argparse.BooleanOptionalAction, default=True,
+        help="Process each conversation as one chunk (only split if > 100k chars). "
+             "Default ON. Use --no-session-mode for legacy 8k chunk-by-chunk extraction.",
     )
     args = parser.parse_args()
+
+    # Resolve model default per provider
+    if args.model is None:
+        args.model = GEMINI_DEFAULT_MODEL if args.provider == "gemini" else OLLAMA_MODEL
+
+    # Gemini auth
+    gemini_key: Optional[str] = None
+    if args.provider == "gemini":
+        gemini_key = _load_env_var("GOOGLE_AI_STUDIO_KEY")
+        if not gemini_key:
+            print("Error: GOOGLE_AI_STUDIO_KEY not in env or .env files", file=sys.stderr)
+            sys.exit(1)
+
+    extract_tmpl = _SESSION_EXTRACT_TMPL if args.session_mode else _IMPORT_EXTRACT_TMPL
+    print(f"Provider: {args.provider}  |  Model: {args.model}  |  "
+          f"Mode: {'session' if args.session_mode else 'chunk-8k'}")
 
     json_path = Path(args.file)
     if not json_path.exists():
@@ -433,8 +659,22 @@ def main() -> None:
     size_mb = json_path.stat().st_size / 1024 / 1024
     print(f"Loading {json_path.name} ({size_mb:.1f} MB)…")
     sys.stdout.flush()
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    if json_path.suffix.lower() == ".zip":
+        # Claude.ai bulk exports ship as a zip — read conversations.json directly
+        # without unpacking to disk.
+        with zipfile.ZipFile(json_path) as zf:
+            inner_name = next(
+                (n for n in zf.namelist() if n.endswith("conversations.json")),
+                None,
+            )
+            if inner_name is None:
+                print(f"Error: no conversations.json inside {json_path}", file=sys.stderr)
+                sys.exit(1)
+            with zf.open(inner_name) as f:
+                data = json.load(f)
+    else:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
     fmt = detect_format(data)
     total = _quick_count(data)
@@ -444,7 +684,7 @@ def main() -> None:
     to_process = max(0, end_idx - args.start)
     print(
         f"Processing [{args.start}, {end_idx}) = {to_process} conversation(s)"
-        + (" [dry-run — no LLM, no DB]" if args.dry_run else "")
+        + (" [dry-run — LLM enabled, DB writes skipped]" if args.dry_run else "")
     )
     sys.stdout.flush()
 
@@ -472,62 +712,94 @@ def main() -> None:
         displayed += 1
         progress = f"[{displayed}/{to_process}]"
 
-        title, text = _conv_to_text(item)
+        title, text, original_ts = _conv_to_text(item)
         label = title[:60] if title else f"(untitled #{raw_idx})"
+        ts_note = f"  @ {original_ts[:19]}" if original_ts else "  @ (no original ts — using now)"
 
         if not text.strip():
-            print(f"{progress} 对话 \"{label}\" → skipped (empty)")
+            print(f"{progress} 对话 \"{label}\"{ts_note} → skipped (empty)")
             sys.stdout.flush()
             continue
 
-        chunks = _chunk_conversation(text)
+        # Session mode: keep the conversation whole; only split if it's huge.
+        if args.session_mode:
+            if len(text) > SESSION_HARD_CHUNK_CHARS:
+                chunks = [text[i : i + SESSION_HARD_CHUNK_CHARS]
+                          for i in range(0, len(text), SESSION_HARD_CHUNK_CHARS)]
+            else:
+                chunks = [text]
+        else:
+            chunks = _chunk_conversation(text)
         total_chunks += len(chunks)
 
-        if args.dry_run:
-            print(f"{progress} 对话 \"{label}\" → {len(chunks)} chunks → [dry-run]")
-            sys.stdout.flush()
-            continue
-
-        assert conn is not None and embed_q is not None
         session_id = f"batch_{json_path.stem}_{raw_idx}"
         conv_memories = 0
         errors = 0
 
         for chunk in chunks:
             try:
-                raw_resp = _call_ollama(_IMPORT_EXTRACT_TMPL.format(chunk=chunk))
+                raw_resp = _call_llm(args.provider, extract_tmpl.format(chunk=chunk),
+                                     args.model, gemini_key)
                 items = _parse_json_list(raw_resp)
             except Exception as exc:
                 errors += 1
                 print(f"  [warn] LLM error: {exc}", file=sys.stderr)
                 continue
 
-            for it in items[:5]:
+            # Session-mode allows up to 8 memories/chunk; chunk-mode keeps the old 5 cap.
+            item_cap = 8 if args.session_mode else 5
+            for it in items[:item_cap]:
                 if not isinstance(it, dict):
                     continue
                 item_content = str(it.get("content", "")).strip()
                 if not item_content:
                     continue
+                # Anchor the memory id to the conversation's original timestamp
+                # when available so re-imports stay chronologically sortable.
+                id_anchor: datetime
+                if original_ts:
+                    try:
+                        id_anchor = datetime.fromisoformat(original_ts)
+                    except ValueError:
+                        id_anchor = datetime.now(timezone.utc)
+                else:
+                    id_anchor = datetime.now(timezone.utc)
                 mid = (
-                    f"mem_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+                    f"mem_{id_anchor.strftime('%Y%m%d%H%M%S%f')}"
                     f"_{random.randint(1000, 9999)}"
                 )
-                insert_memory(
-                    conn,
-                    memory_id=mid,
-                    key=str(it.get("key", ""))[:60] or "untitled",
-                    content=item_content,
-                    category=str(it.get("category", "other")),
-                    importance=max(0.0, min(1.0, float(it.get("importance", 0.5)))),
-                    session_id=session_id,
-                )
-                embed_q.put((mid, item_content))
+                m_key = str(it.get("key", ""))[:60] or "untitled"
+                m_cat = str(it.get("category", "other"))
+                m_imp = max(0.0, min(1.0, float(it.get("importance", 0.5))))
+                m_val = max(0.0, min(1.0, float(it.get("valence", 0.5))))
+                m_aro = max(0.0, min(1.0, float(it.get("arousal", 0.3))))
+
+                if args.dry_run:
+                    snippet = item_content[:80].replace("\n", " ")
+                    print(f"    [dry] {m_cat:10s} imp={m_imp:.2f} val={m_val:.2f} "
+                          f"aro={m_aro:.2f} | {m_key} | {snippet}")
+                else:
+                    assert conn is not None and embed_q is not None
+                    insert_memory(
+                        conn,
+                        memory_id=mid,
+                        key=m_key,
+                        content=item_content,
+                        category=m_cat,
+                        importance=m_imp,
+                        session_id=session_id,
+                        created_at_override=original_ts,
+                        valence=m_val,
+                        arousal=m_aro,
+                    )
+                    embed_q.put((mid, item_content))
+                    total_embed_queued += 1
                 conv_memories += 1
-                total_embed_queued += 1
 
         total_memories += conv_memories
         err_note = f"  [{errors} error(s)]" if errors else ""
-        print(f"{progress} 对话 \"{label}\" → {len(chunks)} chunks → 创建 {conv_memories} 条记忆{err_note}")
+        tag = "[dry-run] 提取" if args.dry_run else "创建"
+        print(f"{progress} 对话 \"{label}\"{ts_note} → {len(chunks)} chunks → {tag} {conv_memories} 条记忆{err_note}")
         sys.stdout.flush()
 
     # Drain embedding queue before exit
@@ -542,7 +814,7 @@ def main() -> None:
     if args.dry_run:
         print(
             f"\nDry-run complete: {displayed} conversation(s), "
-            f"{total_chunks} chunk(s) parsed — no memories written."
+            f"{total_chunks} chunk(s) → {total_memories} memories extracted (NOT written to DB)."
         )
     else:
         print(
