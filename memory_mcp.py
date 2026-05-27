@@ -448,6 +448,24 @@ class MemoryStore:
             for col_name, col_def in _NEW_COLS:
                 if col_name not in columns:
                     self.conn.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS phone_status (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    battery_level INTEGER,
+                    battery_charging INTEGER DEFAULT 0,
+                    current_app TEXT,
+                    screen_time_minutes INTEGER,
+                    location TEXT,
+                    weather TEXT,
+                    temperature REAL,
+                    calendar_events TEXT,
+                    steps INTEGER,
+                    sleep_hours REAL,
+                    heart_rate INTEGER,
+                    raw_json TEXT
+                )
+            """)
             self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -2516,6 +2534,80 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
             self.end_headers()
             self.wfile.write(body)
 
+        # ---- Phone status endpoints ------------------------------------------
+
+        def _handle_phone_status_post(self) -> None:
+            """POST /phone-status — receive phone state from iOS Shortcuts."""
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            try:
+                data = json.loads(body.decode("utf-8", errors="replace"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.send_response(400)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(b'{"error":"invalid JSON"}')
+                return
+
+            ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
+            with store._lock:
+                store.conn.execute(
+                    """INSERT INTO phone_status
+                       (timestamp, battery_level, battery_charging, current_app,
+                        screen_time_minutes, location, weather, temperature,
+                        calendar_events, steps, sleep_hours, heart_rate, raw_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        ts,
+                        data.get("battery_level"),
+                        1 if data.get("battery_charging") else 0,
+                        data.get("current_app"),
+                        data.get("screen_time_minutes"),
+                        data.get("location"),
+                        data.get("weather"),
+                        data.get("temperature"),
+                        data.get("calendar_events"),
+                        data.get("steps"),
+                        data.get("sleep_hours"),
+                        data.get("heart_rate"),
+                        json.dumps(data, ensure_ascii=False),
+                    ),
+                )
+                store.conn.execute(
+                    "DELETE FROM phone_status WHERE id NOT IN "
+                    "(SELECT id FROM phone_status ORDER BY id DESC LIMIT 100)"
+                )
+                store.conn.commit()
+
+            out = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(out)
+
+        def _handle_phone_status_get(self) -> None:
+            """GET /phone-status — return the most recent phone status row."""
+            with store._lock:
+                row = store.conn.execute(
+                    "SELECT * FROM phone_status ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            if not row:
+                out = b'{"error":"no data"}'
+                self.send_response(404)
+            else:
+                out = json.dumps(
+                    {k: row[k] for k in row.keys()},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(out)
+
         # ---- Legacy / endpoint (backward compat) -------------------------
 
         def _handle_legacy_post(self) -> None:
@@ -2891,6 +2983,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_admin_consolidate()
             elif path == "/admin/prune":
                 self._handle_admin_prune()
+            elif path == "/phone-status":
+                self._handle_phone_status_post()
             else:
                 self._handle_legacy_post()
 
@@ -2908,6 +3002,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_embed_status()
             elif path == "/stats":
                 self._handle_stats()
+            elif path == "/phone-status":
+                self._handle_phone_status_get()
             else:
                 info = json.dumps({
                     "name": "memory-mcp",
