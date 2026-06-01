@@ -2536,12 +2536,81 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
 
         # ---- Phone status endpoints ------------------------------------------
 
+        # Chinese key → English column mapping for iOS Shortcuts
+        _ZH_KEY_MAP = {
+            "电量": "battery_level",
+            "battery_level": "battery_level",
+            "充电中": "battery_charging",
+            "battery_charging": "battery_charging",
+            "正在使用": "current_app",
+            "current_app": "current_app",
+            "屏幕使用时间": "screen_time_minutes",
+            "screen_time_minutes": "screen_time_minutes",
+            "当前位置": "location",
+            "location": "location",
+            "天气状况": "weather",
+            "天气": "weather",
+            "weather": "weather",
+            "温度": "temperature",
+            "temperature": "temperature",
+            "日程": "calendar_events",
+            "提醒事项": "calendar_events",
+            "calendar_events": "calendar_events",
+            "步数": "steps",
+            "steps": "steps",
+            "睡眠": "sleep_hours",
+            "sleep_hours": "sleep_hours",
+            "心率": "heart_rate",
+            "heart_rate": "heart_rate",
+            "设备已锁定": "device_locked",
+        }
+
+        def _normalize_phone_data(self, raw: dict) -> dict:
+            """Unwrap nested envelope and map Chinese keys to English columns."""
+            data = dict(raw)
+
+            # Unwrap {"phone-status": "{...}"} envelope from iOS Shortcuts
+            if "phone-status" in data and isinstance(data["phone-status"], str):
+                try:
+                    inner = json.loads(data["phone-status"])
+                    if isinstance(inner, dict):
+                        data = inner
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Map Chinese/mixed keys to canonical English column names
+            norm: dict = {}
+            for k, v in data.items():
+                eng = self._ZH_KEY_MAP.get(k)
+                if eng:
+                    norm[eng] = v
+                else:
+                    norm[k] = v
+
+            # Parse weather string like "17°C and Sunny" into temperature + weather
+            wx = norm.get("weather", "")
+            if isinstance(wx, str) and "°" in wx and norm.get("temperature") is None:
+                import re
+                m = re.search(r"(-?\d+(?:\.\d+)?)\s*°", wx)
+                if m:
+                    norm["temperature"] = float(m.group(1))
+                    # strip the temp part from weather description
+                    desc = re.sub(r"-?\d+(?:\.\d+)?\s*°\s*C?\s*(and\s*)?", "", wx).strip()
+                    if desc:
+                        norm["weather"] = desc
+
+            return norm
+
         def _handle_phone_status_post(self) -> None:
-            """POST /phone-status — receive phone state from iOS Shortcuts."""
+            """POST /phone-status — receive phone state from iOS Shortcuts.
+
+            Accepts both flat JSON and the nested {"phone-status": "..."} format
+            that iOS Shortcuts produces. Keys can be in English or Chinese.
+            """
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
             try:
-                data = json.loads(body.decode("utf-8", errors="replace"))
+                raw = json.loads(body.decode("utf-8", errors="replace"))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self.send_response(400)
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -2549,6 +2618,7 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self.wfile.write(b'{"error":"invalid JSON"}')
                 return
 
+            data = self._normalize_phone_data(raw)
             ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
             with store._lock:
                 store.conn.execute(
