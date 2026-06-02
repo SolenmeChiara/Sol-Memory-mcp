@@ -79,6 +79,85 @@ def _load_dotenv(root: Path) -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+# ---------------------------------------------------------------------------
+# Claude.ai conversation preview (frontstage-facing session list)
+# ---------------------------------------------------------------------------
+
+_CLAUDE_API = "https://claude.ai/api"
+_CLAUDE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _get_claude_session_key() -> Optional[str]:
+    """Find CLAUDE_SESSION_KEY in env, or walk up the tree for a .env that has it."""
+    val = os.environ.get("CLAUDE_SESSION_KEY")
+    if val:
+        return val.strip()
+    here = Path(__file__).resolve().parent
+    for root in [here, *here.parents]:
+        env_path = root / ".env"
+        if not env_path.is_file():
+            continue
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("CLAUDE_SESSION_KEY") and "=" in line:
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def _claude_api_get(path: str, session_key: str):
+    req = urllib.request.Request(
+        f"{_CLAUDE_API}{path}", method="GET",
+        headers={
+            "Cookie": f"sessionKey={session_key}",
+            "User-Agent": _CLAUDE_UA,
+            "Accept": "application/json",
+            "Referer": "https://claude.ai/",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, str(e)
+
+
+def fetch_session_preview(limit: int = 10) -> Dict[str, Any]:
+    """Fetch a preview of recent Claude.ai conversations (titles + times).
+
+    Frontstage-facing: claude.ai has built-in conversation search but no
+    cross-conversation list view, so this gives it the recent-activity overview.
+    """
+    key = _get_claude_session_key()
+    if not key:
+        return {"ok": False, "error": "no CLAUDE_SESSION_KEY found"}
+    status, orgs = _claude_api_get("/organizations", key)
+    if status != 200 or not isinstance(orgs, list):
+        return {"ok": False, "error": f"organizations HTTP {status}"}
+    chat_orgs = [o for o in orgs if "chat" in (o.get("capabilities") or [])]
+    org = chat_orgs[0] if chat_orgs else (orgs[0] if orgs else None)
+    if not org:
+        return {"ok": False, "error": "no chat-capable organization"}
+    status, convs = _claude_api_get(
+        f"/organizations/{org['uuid']}/chat_conversations", key)
+    if status != 200 or not isinstance(convs, list):
+        return {"ok": False, "error": f"conversations HTTP {status}"}
+    convs.sort(key=lambda c: c.get("updated_at") or c.get("created_at") or "",
+               reverse=True)
+    items = []
+    for c in convs[:limit]:
+        items.append({
+            "uuid": c.get("uuid"),
+            "title": (c.get("name") or "").strip() or "(untitled)",
+            "updated_at": c.get("updated_at") or "",
+        })
+    return {"ok": True, "total": len(convs), "conversations": items}
+
+
 def _start_prune_daemon(store: "MemoryStore") -> None:
     """Background sweeper that hard-deletes digested rows past their retention
     window. Sweeps every DIGESTED_PRUNE_INTERVAL_HOURS hours.
@@ -464,6 +543,16 @@ class MemoryStore:
                     sleep_hours REAL,
                     heart_rate INTEGER,
                     raw_json TEXT
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS backend_inbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    source TEXT,
+                    message TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    seen_at TEXT
                 )
             """)
             self.conn.commit()
@@ -1855,6 +1944,37 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "extmcp_session_preview",
+        "description": (
+            "拉取 Claude.ai 上最近活跃对话的预览列表（标题 + 最后活跃时间 + UUID）。"
+            "前台 Claude 没有跨对话的列表视野，这个工具补上这个盲区——"
+            "配合你自带的对话搜索，可以了解'最近在忙什么'。返回的 UUID 可以用对话搜索深入查看。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "返回对话数（默认 10，范围 1-30）"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "extmcp_send_to_backend",
+        "description": (
+            "给后台 nudge agent 发一条消息（异步）。消息会进入收件箱，后台下次唤醒时读取并处理"
+            "（例如推送给 Sol、注入到对话、或写进记忆）。适合定时任务投递邮件总结、提醒等。"
+            "这是单向投递，不会等待回复。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "要发给后台的消息内容"},
+                "source": {"type": "string", "description": "来源标识（可选，如 'email-summary'、'scheduled-task'）"},
+            },
+            "required": ["message"],
+        },
+    },
 ]
 
 
@@ -2346,6 +2466,30 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             "ids": ref_ids,
             "breath": text,
         }, ensure_ascii=False)}]
+
+    elif name == "extmcp_session_preview":
+        limit = max(1, min(30, int(args.get("limit", 10) or 10)))
+        result = fetch_session_preview(limit=limit)
+        return [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]
+
+    elif name == "extmcp_send_to_backend":
+        message = str(args.get("message", "")).strip()
+        if not message:
+            return [{"type": "text", "text": json.dumps(
+                {"ok": False, "error": "message is empty"}, ensure_ascii=False)}]
+        source = str(args.get("source", "") or "").strip()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with store._lock:
+            cur = store.conn.execute(
+                "INSERT INTO backend_inbox (created_at, source, message, status) "
+                "VALUES (?, ?, ?, 'pending')",
+                (now_iso, source, message),
+            )
+            store.conn.commit()
+            row_id = cur.lastrowid
+        return [{"type": "text", "text": json.dumps(
+            {"ok": True, "inbox_id": row_id, "status": "pending"},
+            ensure_ascii=False)}]
 
     else:
         raise ValueError(f"unknown tool: {name}")
