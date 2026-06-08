@@ -2707,20 +2707,36 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
             "心率": "heart_rate",
             "heart_rate": "heart_rate",
             "设备已锁定": "device_locked",
+            "信息截止时间": "timestamp",
+            " battery_charging": "battery_charging",
         }
 
         def _normalize_phone_data(self, raw: dict) -> dict:
             """Unwrap nested envelope and map Chinese keys to English columns."""
             data = dict(raw)
 
-            # Unwrap {"phone-status": "{...}"} envelope from iOS Shortcuts
-            if "phone-status" in data and isinstance(data["phone-status"], str):
-                try:
-                    inner = json.loads(data["phone-status"])
-                    if isinstance(inner, dict):
-                        data = inner
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            # Unwrap nested envelope from iOS Shortcuts.
+            # The key varies: "phone-status", "手机状态", or other single-key wrappers.
+            _ENVELOPE_KEYS = {"phone-status", "手机状态", "phone_status"}
+            for ek in _ENVELOPE_KEYS:
+                if ek in data and isinstance(data[ek], str):
+                    try:
+                        inner = json.loads(data[ek])
+                        if isinstance(inner, dict):
+                            data = inner
+                            break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            # Fallback: if there's exactly one key whose value is a JSON string, unwrap it
+            if len(data) == 1:
+                sole_key = next(iter(data))
+                if isinstance(data[sole_key], str):
+                    try:
+                        inner = json.loads(data[sole_key])
+                        if isinstance(inner, dict):
+                            data = inner
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
             # Map Chinese/mixed keys to canonical English column names
             norm: dict = {}
