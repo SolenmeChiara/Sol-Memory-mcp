@@ -5,6 +5,9 @@
 .env
 .claude/settings.local.json
 .claude/worktrees/
+
+# Codex (OpenAI CLI agent) scratch — unrelated to this project
+.codex/
 *.key
 config.yaml
 config.json
