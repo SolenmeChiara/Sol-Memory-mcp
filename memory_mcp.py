@@ -47,7 +47,7 @@ from batch_import import (
 OLLAMA_BASE_URL: str = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 OLLAMA_TIMEOUT: float = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
-OLLAMA_EMBED_MODEL: str = os.environ.get("OLLAMA_EMBED_MODEL", "bge-m3")
+OLLAMA_EMBED_MODEL: str = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:4b")
 DECAY_LAMBDA: float = float(os.environ.get("DECAY_LAMBDA", "0.05"))
 DECAY_THRESHOLD: float = float(os.environ.get("DECAY_THRESHOLD", "0.3"))
 

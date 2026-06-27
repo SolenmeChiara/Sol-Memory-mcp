@@ -1,4 +1,4 @@
-"""Backfill bge-m3 embeddings for memories whose embedding blob is empty.
+"""Backfill embeddings (qwen3-embedding:4b) for memories whose embedding blob is empty.
 
 Usage:
     python reindex_embeddings.py [--db memory.db] [--workers 4] [--batch 50] [--limit 0]
@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "bge-m3")
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:4b")
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
 MAX_CHARS = 2000
 MAX_CONSECUTIVE_FAILURES = 10
@@ -98,6 +98,7 @@ def run_reindex(
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")  # tolerate the live MCP server's occasional writes
 
     # Skip digested rows — they're archived merge-source fragments and don't
     # participate in search anymore, so spending LLM cycles on their embeddings
