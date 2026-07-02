@@ -1,6 +1,9 @@
 *.db
 *.db-shm
 *.db-wal
+audit_*.md
+backups/
+rescore_progress.json
 *.sqlite
 .env
 .claude/settings.local.json

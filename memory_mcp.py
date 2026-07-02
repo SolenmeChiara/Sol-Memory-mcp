@@ -62,6 +62,10 @@ MMR_MIN_CANDIDATES: int = int(os.environ.get("MMR_MIN_CANDIDATES", "5"))    # be
 DIGESTED_PRUNE_DAYS: int = int(os.environ.get("DIGESTED_PRUNE_DAYS", "90"))                  # hard-delete digested rows older than this
 DIGESTED_PRUNE_INTERVAL_HOURS: float = float(os.environ.get("DIGESTED_PRUNE_INTERVAL_HOURS", "24"))  # daemon sweep interval
 
+# ---- Backup & WAL maintenance ----
+BACKUP_KEEP: int = int(os.environ.get("BACKUP_KEEP", "3"))                                    # rolling daily backups to retain
+WAL_CHECKPOINT_INTERVAL_HOURS: float = float(os.environ.get("WAL_CHECKPOINT_INTERVAL_HOURS", "1"))  # explicit checkpoint cadence
+
 SUMMARIZE_DRY_RUN: bool = False
 
 
@@ -172,6 +176,67 @@ def _start_prune_daemon(store: "MemoryStore") -> None:
                 sys.stderr.flush()
 
     threading.Thread(target=_loop, daemon=True, name="prune-daemon").start()
+
+
+def _start_maintenance_daemon(store: "MemoryStore", db_path: Path) -> None:
+    """WAL checkpointing + rolling daily backups (2026-07-02 audit items).
+
+    Checkpoint: every process keeps one long-lived connection, so SQLite's
+    passive autocheckpoint routinely fails to advance and the WAL grows
+    without bound (observed: 442MB WAL against a 432MB main db). An explicit
+    TRUNCATE checkpoint from the writer connection reclaims whatever other
+    processes' snapshots allow; run hourly it keeps the WAL bounded.
+
+    Backup: sqlite3's online backup API is safe against a live database.
+    One dated file per day under backups/, keeping the newest BACKUP_KEEP.
+    """
+    backups_dir = db_path.parent / "backups"
+
+    def _checkpoint() -> None:
+        with store._lock:
+            row = store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if row and row[0]:
+            # busy=1 → another connection's snapshot blocked full truncation
+            sys.stderr.write(
+                f"[maint] wal_checkpoint incomplete (busy): "
+                f"wal_pages={row[1]} checkpointed={row[2]}\n"
+            )
+
+    def _backup() -> None:
+        backups_dir.mkdir(exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        target = backups_dir / f"memory-{stamp}.db"
+        if target.exists():
+            return  # today's already done
+        dst = sqlite3.connect(str(target))
+        try:
+            with store._lock:
+                store.conn.backup(dst)
+        finally:
+            dst.close()
+        old_files = sorted(backups_dir.glob("memory-????-??-??.db"))
+        for old in old_files[:-BACKUP_KEEP]:
+            old.unlink(missing_ok=True)
+        sys.stderr.write(
+            f"[maint] daily backup written: {target.name} "
+            f"({target.stat().st_size // 1048576}MB, keeping {BACKUP_KEEP})\n"
+        )
+
+    def _loop() -> None:
+        # Eager pass shortly after startup (inside the thread so a ~400MB
+        # backup copy never blocks server startup), then hourly.
+        while True:
+            try:
+                _checkpoint()
+            except Exception as exc:
+                sys.stderr.write(f"[maint-daemon] checkpoint error: {exc}\n")
+            try:
+                _backup()  # no-op if today's file exists
+            except Exception as exc:
+                sys.stderr.write(f"[maint-daemon] backup error: {exc}\n")
+            _time_mod.sleep(WAL_CHECKPOINT_INTERVAL_HOURS * 3600)
+
+    threading.Thread(target=_loop, daemon=True, name="maint-daemon").start()
 
 
 def _call_ollama(prompt: str) -> str:
@@ -703,10 +768,15 @@ class MemoryStore:
     def touch_memory(self, memory_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            # Primary: refresh last_active + activation_count+1
+            # Primary: refresh last_active + activation_count+1.
+            # Deliberately does NOT bump updated_at: touch fires on every
+            # search hit / recall, and updated_at is the "recent" ordering key
+            # for list/dream/summarize — letting reads refresh it made old
+            # memories masquerade as new activity (2026-07-02 audit). Decay
+            # and digested-pruning both read last_active, which we do update.
             self.conn.execute(
-                "UPDATE memories SET last_active=?, activation_count=activation_count+1, updated_at=? WHERE id=?",
-                (now, now, memory_id),
+                "UPDATE memories SET last_active=?, activation_count=activation_count+1 WHERE id=?",
+                (now, memory_id),
             )
             # Time ripple: neighbours within ±48h get activation_count+0.2
             row = self.conn.execute(
@@ -3354,6 +3424,7 @@ def main() -> None:
     except Exception as exc:
         sys.stderr.write(f"[prune-startup] error: {exc}\n")
     _start_prune_daemon(store)
+    _start_maintenance_daemon(store, db_path)
 
     if args.http:
         _run_http(store, args.host, args.port)
