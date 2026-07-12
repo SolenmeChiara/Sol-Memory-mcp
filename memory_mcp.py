@@ -2868,6 +2868,22 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
             if isinstance(norm.get("weather"), str):
                 norm["weather"] = norm["weather"].strip().lstrip("，, ").strip()
 
+            # Sanity bounds: shortcut health-sample math sometimes explodes
+            # (multi-day sums, duplicate iPhone+Watch sources — 316152 steps
+            # has really happened). Garbage is dropped from the structured
+            # columns but survives verbatim in raw_json.
+            for key, lo, hi in (("steps", 0, 100000), ("heart_rate", 20, 250)):
+                v = norm.get(key)
+                if v is None:
+                    continue
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    norm[key] = None
+                    continue
+                if not (lo <= f <= hi):
+                    norm[key] = None
+
             # Chinese timestamp ("2026年7月12日 11:40") -> ISO with local tz,
             # so the injector's "N minutes ago" math works.
             ts = norm.get("timestamp")
