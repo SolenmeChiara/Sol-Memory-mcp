@@ -621,6 +621,7 @@ class MemoryStore:
             _PHONE_NEW_COLS = [
                 ("focus_mode",    "TEXT"),     # 勿扰/睡眠/工作 — nudge timing signal
                 ("device_locked", "INTEGER"),  # NULL = not reported
+                ("now_playing",   "TEXT"),     # system-wide current track
             ]
             phone_cols = {
                 r[1] for r in self.conn.execute("PRAGMA table_info(phone_status)")
@@ -2812,6 +2813,9 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
             "device_locked": "device_locked",
             "专注模式": "focus_mode",
             "focus_mode": "focus_mode",
+            "当前歌曲": "now_playing",
+            "正在播放": "now_playing",
+            "now_playing": "now_playing",
             "信息截止时间": "timestamp",
             " battery_charging": "battery_charging",
         }
@@ -2942,8 +2946,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                        (timestamp, battery_level, battery_charging, current_app,
                         screen_time_minutes, location, weather, temperature,
                         calendar_events, steps, sleep_hours, heart_rate,
-                        focus_mode, device_locked, raw_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        focus_mode, device_locked, now_playing, raw_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         ts,
                         data.get("battery_level"),
@@ -2959,6 +2963,7 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                         data.get("heart_rate"),
                         data.get("focus_mode"),
                         device_locked,
+                        (data.get("now_playing") or "").strip() or None,
                         # Wire-format body, pre-normalization: the one place
                         # to see exactly what the shortcut sent (debugging
                         # envelope/key issues). Normalized values live in the
