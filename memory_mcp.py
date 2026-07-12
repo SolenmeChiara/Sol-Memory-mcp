@@ -617,6 +617,19 @@ class MemoryStore:
                     raw_json TEXT
                 )
             """)
+            # Columns added after the table shipped (same pattern as memories)
+            _PHONE_NEW_COLS = [
+                ("focus_mode",    "TEXT"),     # 勿扰/睡眠/工作 — nudge timing signal
+                ("device_locked", "INTEGER"),  # NULL = not reported
+            ]
+            phone_cols = {
+                r[1] for r in self.conn.execute("PRAGMA table_info(phone_status)")
+            }
+            for col_name, col_def in _PHONE_NEW_COLS:
+                if col_name not in phone_cols:
+                    self.conn.execute(
+                        f"ALTER TABLE phone_status ADD COLUMN {col_name} {col_def}"
+                    )
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS backend_inbox (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2796,6 +2809,9 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
             "心率": "heart_rate",
             "heart_rate": "heart_rate",
             "设备已锁定": "device_locked",
+            "device_locked": "device_locked",
+            "专注模式": "focus_mode",
+            "focus_mode": "focus_mode",
             "信息截止时间": "timestamp",
             " battery_charging": "battery_charging",
         }
@@ -2848,6 +2864,27 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                     if desc:
                         norm["weather"] = desc
 
+            # Shortcut string concat leaves stray leading separators ("，晴")
+            if isinstance(norm.get("weather"), str):
+                norm["weather"] = norm["weather"].strip().lstrip("，, ").strip()
+
+            # Chinese timestamp ("2026年7月12日 11:40") -> ISO with local tz,
+            # so the injector's "N minutes ago" math works.
+            ts = norm.get("timestamp")
+            if isinstance(ts, str) and "年" in ts:
+                import re
+                m = re.search(
+                    r"(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{2})", ts
+                )
+                if m:
+                    y, mo, d, h, mi = (int(g) for g in m.groups())
+                    try:
+                        norm["timestamp"] = datetime(
+                            y, mo, d, h, mi
+                        ).astimezone().isoformat()
+                    except ValueError:
+                        pass
+
             return norm
 
         def _handle_phone_status_post(self) -> None:
@@ -2869,13 +2906,28 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
 
             data = self._normalize_phone_data(raw)
             ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
+
+            # Tri-state lock flag: NULL = not reported, else 0/1.
+            # Shortcuts may send a bool or a localized string.
+            dl_raw = data.get("device_locked")
+            if dl_raw is None:
+                device_locked = None
+            elif isinstance(dl_raw, str):
+                device_locked = (
+                    0 if dl_raw.strip() in ("", "0", "false", "False", "否", "no")
+                    else 1
+                )
+            else:
+                device_locked = 1 if dl_raw else 0
+
             with store._lock:
                 store.conn.execute(
                     """INSERT INTO phone_status
                        (timestamp, battery_level, battery_charging, current_app,
                         screen_time_minutes, location, weather, temperature,
-                        calendar_events, steps, sleep_hours, heart_rate, raw_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        calendar_events, steps, sleep_hours, heart_rate,
+                        focus_mode, device_locked, raw_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         ts,
                         data.get("battery_level"),
@@ -2889,6 +2941,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                         data.get("steps"),
                         data.get("sleep_hours"),
                         data.get("heart_rate"),
+                        data.get("focus_mode"),
+                        device_locked,
                         json.dumps(data, ensure_ascii=False),
                     ),
                 )
