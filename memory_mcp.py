@@ -2943,7 +2943,11 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                         data.get("heart_rate"),
                         data.get("focus_mode"),
                         device_locked,
-                        json.dumps(data, ensure_ascii=False),
+                        # Wire-format body, pre-normalization: the one place
+                        # to see exactly what the shortcut sent (debugging
+                        # envelope/key issues). Normalized values live in the
+                        # structured columns.
+                        body.decode("utf-8", errors="replace"),
                     ),
                 )
                 store.conn.execute(
