@@ -20,6 +20,7 @@ import sys
 import threading
 import time as _time_mod
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import asdict, dataclass
@@ -514,13 +515,19 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.vector_weight = vector_weight
         self.keyword_weight = keyword_weight
-        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        # timeout=15 gives the connection a 15s busy handler from the very
+        # first statement — the maintenance daemon's hourly checkpoint / daily
+        # backup briefly locks the db, and a process starting inside that
+        # window used to die on the journal_mode pragma (busy_timeout was set
+        # too late, after the pragma that needed it).
+        self.conn = sqlite3.connect(str(db_path), check_same_thread=False,
+                                    timeout=15)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         with self._lock:
+            self.conn.execute("PRAGMA busy_timeout=15000")
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA synchronous=NORMAL")
-            self.conn.execute("PRAGMA busy_timeout=5000")
         self._init_db()
 
         # ---- Embedding index cache ----
@@ -618,6 +625,18 @@ class MemoryStore:
                     message TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     seen_at TEXT
+                )
+            """)
+            # Event stream from iOS Shortcuts automations (alarm stopped,
+            # sleep focus on/off, wifi join, charging...). Unlike phone_status
+            # (a snapshot that answers "how are things now"), each row is a
+            # point-in-time "this just happened" marker.
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS phone_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    detail TEXT
                 )
             """)
             self.conn.commit()
@@ -2908,6 +2927,95 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
             self.end_headers()
             self.wfile.write(out)
 
+        def _handle_phone_event_post(self) -> None:
+            """POST /phone-event — one event from an iOS Shortcuts automation.
+
+            Body: JSON {"event": "alarm_stopped", "detail": "..."} (detail
+            optional). A bare string body is tolerated and treated as the
+            event name. Timestamp is stamped server-side.
+            """
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            try:
+                raw = json.loads(body.decode("utf-8", errors="replace"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Tolerate a plain-text body: treat it as the event name.
+                raw = body.decode("utf-8", errors="replace").strip()
+
+            if isinstance(raw, str):
+                data = {"event": raw}
+            elif isinstance(raw, dict):
+                data = raw
+            else:
+                data = {}
+
+            event = str(data.get("event") or "").strip()
+            if not event:
+                out = b'{"error":"missing event field"}'
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(out)
+                return
+
+            detail = data.get("detail")
+            ts = datetime.now(timezone.utc).isoformat()
+            with store._lock:
+                store.conn.execute(
+                    "INSERT INTO phone_events (timestamp, event, detail) "
+                    "VALUES (?,?,?)",
+                    (ts, event[:100], str(detail)[:300] if detail else None),
+                )
+                store.conn.execute(
+                    "DELETE FROM phone_events WHERE id NOT IN "
+                    "(SELECT id FROM phone_events ORDER BY id DESC LIMIT 500)"
+                )
+                store.conn.commit()
+
+            out = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(out)
+
+        def _handle_phone_event_get(self) -> None:
+            """GET /phone-event?hours=48&limit=20 — recent events, newest first."""
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                hours = float(qs.get("hours", ["48"])[0])
+            except ValueError:
+                hours = 48.0
+            try:
+                limit = int(qs.get("limit", ["20"])[0])
+            except ValueError:
+                limit = 20
+            since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+            with store._lock:
+                rows = store.conn.execute(
+                    "SELECT timestamp, event, detail FROM phone_events "
+                    "WHERE timestamp >= ? ORDER BY id DESC LIMIT ?",
+                    (since, max(1, min(limit, 100))),
+                ).fetchall()
+            out = json.dumps(
+                {"events": [
+                    {"timestamp": r["timestamp"], "event": r["event"],
+                     "detail": r["detail"]}
+                    for r in rows
+                ]},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(out)
+
         # ---- Legacy / endpoint (backward compat) -------------------------
 
         def _handle_legacy_post(self) -> None:
@@ -3285,6 +3393,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_admin_prune()
             elif path == "/phone-status":
                 self._handle_phone_status_post()
+            elif path == "/phone-event":
+                self._handle_phone_event_post()
             else:
                 self._handle_legacy_post()
 
@@ -3304,6 +3414,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_stats()
             elif path == "/phone-status":
                 self._handle_phone_status_get()
+            elif path == "/phone-event":
+                self._handle_phone_event_get()
             else:
                 info = json.dumps({
                     "name": "memory-mcp",
