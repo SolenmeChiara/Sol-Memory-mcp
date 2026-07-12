@@ -2966,7 +2966,9 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 store.conn.execute(
                     "INSERT INTO phone_events (timestamp, event, detail) "
                     "VALUES (?,?,?)",
-                    (ts, event[:100], str(detail)[:300] if detail else None),
+                    # Generous detail cap: screen_share events carry a whole
+                    # screen's OCR text, consumed on demand via GET.
+                    (ts, event[:100], str(detail)[:2000] if detail else None),
                 )
                 store.conn.execute(
                     "DELETE FROM phone_events WHERE id NOT IN "
