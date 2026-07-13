@@ -632,6 +632,16 @@ class MemoryStore:
                     self.conn.execute(
                         f"ALTER TABLE phone_status ADD COLUMN {col_name} {col_def}"
                     )
+            # urgent messages bypass the wakeup cycle: the injector's sleep
+            # loop polls for them and tmux-injects straight into CC's chat
+            inbox_cols = {
+                r[1] for r in self.conn.execute("PRAGMA table_info(backend_inbox)")
+            }
+            if "priority" not in inbox_cols:
+                self.conn.execute(
+                    "ALTER TABLE backend_inbox "
+                    "ADD COLUMN priority TEXT DEFAULT 'normal'"
+                )
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS backend_inbox (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2066,8 +2076,10 @@ TOOLS = [
     {
         "name": "extmcp_send_to_backend",
         "description": (
-            "给后台 nudge agent 发一条消息（异步）。消息会进入收件箱，后台下次唤醒时读取并处理"
+            "给后台 nudge agent 发一条消息（异步）。默认消息进入收件箱，后台下次唤醒时读取并处理"
             "（例如推送给 Sol、注入到对话、或写进记忆）。适合定时任务投递邮件总结、提醒等。"
+            "urgent=true 时走紧急通道：注入器约 30 秒内直接把消息作为用户消息插播进后台的对话流，"
+            "不等唤醒周期——只用于要紧的小事（急提醒、需要立刻推送/处理的情况），滥用会频繁打断后台。"
             "这是单向投递，不会等待回复。"
         ),
         "inputSchema": {
@@ -2075,6 +2087,7 @@ TOOLS = [
             "properties": {
                 "message": {"type": "string", "description": "要发给后台的消息内容"},
                 "source": {"type": "string", "description": "来源标识（可选，如 'email-summary'、'scheduled-task'）"},
+                "urgent": {"type": "boolean", "description": "true=紧急插播（约 30s 内直达后台对话流）；默认 false=下次唤醒时处理"},
             },
             "required": ["message"],
         },
@@ -2582,17 +2595,20 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             return [{"type": "text", "text": json.dumps(
                 {"ok": False, "error": "message is empty"}, ensure_ascii=False)}]
         source = str(args.get("source", "") or "").strip()
+        priority = "urgent" if args.get("urgent") else "normal"
         now_iso = datetime.now(timezone.utc).isoformat()
         with store._lock:
             cur = store.conn.execute(
-                "INSERT INTO backend_inbox (created_at, source, message, status) "
-                "VALUES (?, ?, ?, 'pending')",
-                (now_iso, source, message),
+                "INSERT INTO backend_inbox "
+                "(created_at, source, message, status, priority) "
+                "VALUES (?, ?, ?, 'pending', ?)",
+                (now_iso, source, message, priority),
             )
             store.conn.commit()
             row_id = cur.lastrowid
         return [{"type": "text", "text": json.dumps(
-            {"ok": True, "inbox_id": row_id, "status": "pending"},
+            {"ok": True, "inbox_id": row_id, "status": "pending",
+             "priority": priority},
             ensure_ascii=False)}]
 
     else:
