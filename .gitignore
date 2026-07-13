@@ -1,6 +1,7 @@
 *.db
 *.db-shm
 *.db-wal
+*.stale
 audit_*.md
 backups/
 
