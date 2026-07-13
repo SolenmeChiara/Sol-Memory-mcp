@@ -22,6 +22,7 @@ import time as _time_mod
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -3097,6 +3098,77 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
             self.end_headers()
             self.wfile.write(out)
 
+        # ---- Screen peek (agent-initiated screenshot) --------------------
+        # Reverse channel: the backstage agent sends a trigger mail, Sol's
+        # iPhone "on receiving email" automation screenshots and POSTs here.
+        # Files are named {ms}_{uuid}.png so lexical order == time order;
+        # no metadata file needed.
+
+        _PEEK_DIR = Path(__file__).resolve().parent / "peeks"
+        _PEEK_MAX_KEEP = 10
+        _PEEK_MAX_BYTES = 30 * 1024 * 1024
+        _peek_lock = threading.Lock()
+
+        @classmethod
+        def _peek_files(cls) -> list:
+            if not cls._PEEK_DIR.exists():
+                return []
+            return sorted(cls._PEEK_DIR.glob("*.png"))
+
+        def _handle_peek_post(self) -> None:
+            """POST /peek — body is the raw screenshot image."""
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > self._PEEK_MAX_BYTES:
+                out = b'{"ok":false,"error":"empty or oversized body"}'
+                self.send_response(400)
+            else:
+                body = self.rfile.read(length)
+                fname = f"{int(_time.time() * 1000)}_{uuid.uuid4().hex[:8]}.png"
+                with self._peek_lock:
+                    self._PEEK_DIR.mkdir(exist_ok=True)
+                    (self._PEEK_DIR / fname).write_bytes(body)
+                    for old in self._peek_files()[:-self._PEEK_MAX_KEEP]:
+                        try:
+                            old.unlink()
+                        except OSError:
+                            pass
+                out = json.dumps({"ok": True, "file": fname}).encode()
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(out)
+
+        def _handle_peek_latest(self) -> None:
+            """GET /peek/latest — newest screenshot's paths and freshness."""
+            files = self._peek_files()
+            if not files:
+                out = b'{"error":"no screenshots"}'
+                self.send_response(404)
+            else:
+                newest = files[-1]
+                try:
+                    ts_ms = int(newest.name.split("_")[0])
+                except ValueError:
+                    ts_ms = int(newest.stat().st_mtime * 1000)
+                win_path = str(newest)
+                drive = win_path[0].lower()
+                wsl_path = f"/mnt/{drive}{win_path[2:]}".replace("\\", "/")
+                out = json.dumps({
+                    "file": newest.name,
+                    "ts_ms": ts_ms,
+                    "age_seconds": round(_time.time() - ts_ms / 1000, 1),
+                    "win_path": win_path,
+                    "wsl_path": wsl_path,
+                }).encode()
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(out)
+
         # ---- Legacy / endpoint (backward compat) -------------------------
 
         def _handle_legacy_post(self) -> None:
@@ -3476,6 +3548,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_phone_status_post()
             elif path == "/phone-event":
                 self._handle_phone_event_post()
+            elif path == "/peek":
+                self._handle_peek_post()
             else:
                 self._handle_legacy_post()
 
@@ -3497,6 +3571,8 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 self._handle_phone_status_get()
             elif path == "/phone-event":
                 self._handle_phone_event_get()
+            elif path == "/peek/latest":
+                self._handle_peek_latest()
             else:
                 info = json.dumps({
                     "name": "memory-mcp",

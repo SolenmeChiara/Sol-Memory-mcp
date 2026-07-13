@@ -3,6 +3,9 @@
 *.db-wal
 audit_*.md
 backups/
+
+# Agent-requested iPhone screenshots — private, never commit
+peeks/
 rescore_progress.json
 *.sqlite
 .env
