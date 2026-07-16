@@ -1,14 +1,25 @@
-"""Backfill embeddings (qwen3-embedding:4b) for memories whose embedding blob is empty.
+"""Backfill / re-align embeddings for memories in the SQLite store.
 
 Usage:
     python reindex_embeddings.py [--db memory.db] [--workers 4] [--batch 50] [--limit 0]
+    python reindex_embeddings.py --fix-dims [--include-digested] [--db memory.db]
 
 Behaviour:
-- Only processes rows where length(embedding) = 0 (safe to re-run; resumes automatically).
+- Default: only processes rows where length(embedding) = 0 (safe to re-run;
+  resumes automatically). Fully backward-compatible with older invocations.
+- --fix-dims: probes the current embedding model's output dimension at runtime,
+  then re-embeds every row whose blob length doesn't match that dimension. This
+  is a superset of the empty rows — it also catches stale vectors left over from
+  a previous model with a different dimension, which the live search index
+  silently drops (dimension mismatch). By default only digested = 0 rows.
+- --include-digested: with --fix-dims, also re-embed digested = 1 rows (archived
+  fragments that don't participate in search). Off by default — usually waste.
 - Parallel workers hit Ollama; main thread batches the SQLite writes.
-- Progress to stderr every 100 rows.
+- Progress to stderr every `batch` rows (default 50).
 - Aborts loudly if 10 consecutive Ollama calls fail (assumes server unreachable
   or model unloaded — surface the error rather than silently skipping).
+- Idempotent: a re-embedded row's blob then matches the target dimension, so a
+  second run selects nothing.
 """
 from __future__ import annotations
 
@@ -33,6 +44,32 @@ MAX_CONSECUTIVE_FAILURES = 10
 
 def pack_embedding(values):
     return struct.pack(f"<{len(values)}f", *values) if values else b""
+
+
+def build_pending_where(
+    fix_dims: bool, target_bytes: "int | None", include_digested: bool
+) -> "tuple[str, tuple]":
+    """SQL WHERE clause (+ params) selecting rows that still need (re)embedding.
+
+    Single source of truth shared by the count-scan in main() and the row-fetch
+    in run_reindex, so the two can never drift apart.
+
+    - default (fix_dims=False): rows with an empty embedding blob.
+    - fix_dims=True: rows whose blob byte-length != the current model's width
+      (NULL and empty blobs included — a strict superset of the empty case).
+
+    include_digested=False appends `AND digested = 0` (archived fragments don't
+    participate in search, so re-embedding them is wasted work).
+    """
+    if fix_dims:
+        clause = "(embedding IS NULL OR length(embedding) != ?)"
+        params: tuple = (target_bytes,)
+    else:
+        clause = "length(embedding) = 0"
+        params = ()
+    if not include_digested:
+        clause += " AND digested = 0"
+    return clause, params
 
 
 class EmbedDataError(Exception):
@@ -81,10 +118,18 @@ def run_reindex(
     workers: int = 4,
     batch: int = 50,
     limit: int = 0,
+    fix_dims: bool = False,
+    include_digested: bool = False,
+    target_dim: "int | None" = None,
     progress_cb=None,
     stop_event: "threading.Event | None" = None,
 ) -> dict:
-    """Backfill bge-m3 embeddings in-place. Reusable by CLI and web server.
+    """Backfill / re-align embeddings in-place. Reusable by CLI and web server.
+
+    fix_dims: when True, re-embed every row whose blob byte-length != target_dim*4
+        (a superset of the empty rows) instead of only empty blobs. Requires a
+        positive target_dim (the caller probes the model's dimension once first).
+    include_digested: when True, don't exclude digested = 1 rows.
 
     progress_cb: optional callable(dict) invoked every `batch`-worth of results
         and once at completion. Dict keys: processed, total, success, failed,
@@ -100,13 +145,17 @@ def run_reindex(
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")  # tolerate the live MCP server's occasional writes
 
-    # Skip digested rows — they're archived merge-source fragments and don't
-    # participate in search anymore, so spending LLM cycles on their embeddings
-    # would be pure waste.
+    # Row selection is shared with main()'s count scan via build_pending_where.
+    # Default: only empty blobs, skipping digested archives (archived merge-source
+    # fragments that don't participate in search — re-embedding them is pure
+    # waste). --fix-dims widens this to every dimension-mismatched blob.
+    if fix_dims and (target_dim is None or target_dim <= 0):
+        raise ValueError("run_reindex(fix_dims=True) requires a positive target_dim")
+    target_bytes = target_dim * 4 if (fix_dims and target_dim) else None
+    where_clause, where_params = build_pending_where(fix_dims, target_bytes, include_digested)
     rows = conn.execute(
-        "SELECT id, content FROM memories "
-        "WHERE length(embedding) = 0 AND digested = 0 "
-        "ORDER BY rowid"
+        f"SELECT id, content FROM memories WHERE {where_clause} ORDER BY rowid",
+        where_params,
     ).fetchall()
     if limit > 0:
         rows = rows[:limit]
@@ -233,7 +282,7 @@ def main() -> None:
                 pass
 
     parser = argparse.ArgumentParser(
-        description="Backfill bge-m3 embeddings for memories with empty embedding blobs"
+        description="Backfill / re-align embeddings for memories in the SQLite store"
     )
     parser.add_argument("--db", default="memory.db", help="SQLite database path (default: memory.db)")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent ollama workers (default: 4)")
@@ -242,6 +291,17 @@ def main() -> None:
         "--limit", type=int, default=0,
         help="Process at most N rows (0 = all; useful for debugging)",
     )
+    parser.add_argument(
+        "--fix-dims", action="store_true",
+        help="Re-embed every row whose vector dimension != the current model's "
+             "(probed at runtime), not just empty rows. Fixes stale vectors left "
+             "over from a previous embedding model with a different dimension.",
+    )
+    parser.add_argument(
+        "--include-digested", action="store_true",
+        help="With --fix-dims, also re-embed digested=1 rows (off by default; "
+             "they don't participate in search, so re-embedding them is waste).",
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db).resolve()
@@ -249,19 +309,54 @@ def main() -> None:
         print(f"[ERROR] db not found: {db_path}", file=sys.stderr)
         sys.exit(1)
 
-    # First, log the scan so CLI users see what's happening before progress_cb fires
+    # --fix-dims: probe the current model's output dimension once up front, so we
+    # know which existing blobs are stale (wrong byte-width) and must be re-done.
+    target_dim: "int | None" = None
+    target_bytes: "int | None" = None
+    if args.fix_dims:
+        sys.stderr.write(f"[fix-dims] probing current model dimension via {OLLAMA_EMBED_MODEL} ...\n")
+        sys.stderr.flush()
+        try:
+            probe_vec = fetch_embedding("dimension probe")
+        except Exception as exc:
+            print(
+                f"[ERROR] could not probe embedding dimension "
+                f"({type(exc).__name__}: {exc}) — is ollama running and "
+                f"{OLLAMA_EMBED_MODEL} pulled?",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        target_dim = len(probe_vec)
+        if target_dim <= 0:
+            print("[ERROR] model returned a zero-length embedding for the probe.", file=sys.stderr)
+            sys.exit(1)
+        target_bytes = target_dim * 4
+        scope = "all rows" if args.include_digested else "digested=0 rows only"
+        sys.stderr.write(
+            f"[fix-dims] current dimension = {target_dim} ({target_bytes} bytes/vector); "
+            f"re-embedding {scope} whose blob length differs.\n"
+        )
+        sys.stderr.flush()
+
+    # First, log the scan so CLI users see what's happening before progress_cb fires.
+    # WHERE clause is shared with run_reindex via build_pending_where.
+    where_clause, where_params = build_pending_where(args.fix_dims, target_bytes, args.include_digested)
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     pending = conn.execute(
-        "SELECT COUNT(*) FROM memories WHERE length(embedding)=0 AND digested=0"
+        f"SELECT COUNT(*) FROM memories WHERE {where_clause}", where_params
     ).fetchone()[0]
     conn.close()
     if args.limit > 0:
         pending = min(pending, args.limit)
     if pending == 0:
-        sys.stderr.write("Nothing to do — every memory already has an embedding.\n")
+        if args.fix_dims:
+            sys.stderr.write("Nothing to do — every embedding already matches the current dimension.\n")
+        else:
+            sys.stderr.write("Nothing to do — every memory already has an embedding.\n")
         return
+    verb = "Re-embedding" if args.fix_dims else "Backfilling"
     sys.stderr.write(
-        f"Backfilling {pending} memories  workers={args.workers}  batch={args.batch}  "
+        f"{verb} {pending} memories  workers={args.workers}  batch={args.batch}  "
         f"model={OLLAMA_EMBED_MODEL}  timeout={OLLAMA_TIMEOUT}s\n"
     )
     sys.stderr.flush()
@@ -280,6 +375,8 @@ def main() -> None:
 
     final = run_reindex(
         db_path, workers=args.workers, batch=args.batch, limit=args.limit,
+        fix_dims=args.fix_dims, include_digested=args.include_digested,
+        target_dim=target_dim,
         progress_cb=cli_progress,
     )
 

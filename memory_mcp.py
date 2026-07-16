@@ -1791,7 +1791,7 @@ async function pollAdminTask(taskId,kind){
   }
 }
 btnReindex.addEventListener('click',()=>{
-  if(!confirm('启动 embedding 补齐任务？会占用 ollama/bge-m3。')) return;
+  if(!confirm('启动 embedding 补齐任务？会占用 ollama/__EMBED_MODEL__。')) return;
   startAdminTask('reindex',{workers:4,batch:50});
 });
 btnPrune.addEventListener('click',async()=>{
@@ -2036,7 +2036,7 @@ TOOLS = [
     {
         "name": "extmcp_search_memory",
         "description": (
-            "Hybrid keyword (BM25) + vector (bge-m3 cosine) search over the memory store. "
+            f"Hybrid keyword (BM25) + vector ({OLLAMA_EMBED_MODEL} cosine) search over the memory store. "
             "Returns full content, valence, arousal, pinned, and decay_score per hit. "
             "Hits are touched (activation_count +1) as a side effect. "
             "Tune `limit` yourself to match the task: 3-5 for precise lookup, 8 (default) "
@@ -2185,7 +2185,7 @@ TOOLS = [
         "name": "extmcp_dream",
         "description": (
             "Introspective analysis of recent memories. Finds the most semantically "
-            "connected pair (via bge-m3 cosine similarity) and generates a reflective "
+            f"connected pair (via {OLLAMA_EMBED_MODEL} cosine similarity) and generates a reflective "
             "summary. Shows each memory's key, emotion scores (valence/arousal), "
             "decay_score, and content. Call this to discover hidden connections or "
             "decide which memories to resolve/digest. No parameters needed."
@@ -3579,7 +3579,7 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
         # ---- Import web UI -----------------------------------------------
 
         def _handle_import_get(self) -> None:
-            body = _IMPORT_HTML.encode("utf-8")
+            body = _IMPORT_HTML.replace("__EMBED_MODEL__", OLLAMA_EMBED_MODEL).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -3624,7 +3624,7 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
 
             UI tracks the high-water mark client-side to render a progress bar
             for the post-extraction phase (when LLM extraction is done but
-            bge-m3 is still chewing through the backlog).
+            the embedding model is still chewing through the backlog).
             """
             self._send_json(200, {"pending": _IMPORT_EMBED_QUEUE.qsize()})
 
