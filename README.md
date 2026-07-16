@@ -7,7 +7,7 @@ A lightweight SQLite-backed MCP memory server with hybrid retrieval (keyword + v
 ## Features
 
 - Save, search, list and delete memory entries
-- BM25 keyword search fused with bge-m3 vector cosine similarity
+- BM25 keyword search fused with qwen3-embedding:4b vector cosine similarity
 - Ebbinghaus decay formula weighted by emotional arousal
 - Chinese summarization / sentiment analysis / memory extraction via a local Ollama model
 - Two transports: stdio (Claude Desktop) and Streamable HTTP (phones, remote clients)
@@ -55,6 +55,23 @@ python memory_mcp.py --http --port 3456 --db ./memory.db
 | `extmcp_recall_session` | Pull the full memory timeline of one session by `session_id` |
 | `extmcp_session_preview` | Peek at the last few messages of recent conversations |
 | `extmcp_send_to_backend` | Leave a message in the backend inbox; `urgent=true` requests express delivery (the agent's injector polls every 30s and types it straight into the agent's chat) |
+| `extmcp_get_memory` | Direct lookup by `id` / exact `key` / `key_prefix` — straight SQL, bypasses semantic search and does **not** activate |
+| `extmcp_set_tier` | Explicit promote / demote: set a memory's `tier` (+ optional `until_days` for watch expiry) |
+
+## Memory tiers
+
+Every memory carries a `tier` column (plus `tier_until`) placing it in the layered-memory architecture. `extmcp_save_memory` accepts an optional `tier`, `extmcp_list_memories` can filter by it, and search / list results report it. Breath output is now segmented (PINNED / CORE / WORKING / WATCH / TOP UNRESOLVED) and every line is prefixed with `[id:mem_xxx]` so an exposed memory can be maintained directly.
+
+| tier | Meaning | Breath behaviour |
+|---|---|---|
+| `''` | Ordinary memory | TOP UNRESOLVED, by decay score (fully backward-compatible) |
+| `working` | Active working memory (live promises) | Own segment, fully surfaced; resolving one auto-archives it (tier→archive) |
+| `watch` | Parked-with-expiry (e.g. crisis records) | Own segment with expiry date; auto-demoted to archive once `tier_until` passes (default 14 days) |
+| `core` | Constitutional layer (boundaries / protocols) | Own segment, 2 entries on a deterministic day-of-year rotation |
+| `archive` | Biography / history layer | **Never enters breath**, still retrievable |
+| `seabed` | Seabed — the April bulk import | **Never enters breath**, still retrievable (promote with `set_tier`) |
+
+To promote (e.g. seabed → active) or demote / close out, use `extmcp_set_tier`. To look up an exposed memory by its breath id or key without perturbing activation, use `extmcp_get_memory`.
 
 ## HTTP endpoints
 
@@ -153,7 +170,7 @@ The `/breath-hook` endpoint itself is **read-only** and never activates memories
 |---|---|---|
 | `OLLAMA_BASE_URL` | Ollama address | `http://localhost:11434` |
 | `OLLAMA_MODEL` | summarization / extraction model | `gemma4:e4b` |
-| `OLLAMA_EMBED_MODEL` | embedding model | `bge-m3` |
+| `OLLAMA_EMBED_MODEL` | embedding model | `qwen3-embedding:4b` |
 | `OLLAMA_TIMEOUT` | request timeout (s) | `180` |
 | `DECAY_LAMBDA` | decay coefficient | `0.05` |
 | `DECAY_THRESHOLD` | decay threshold | `0.3` |
@@ -168,7 +185,7 @@ Key columns of the `memories` table:
 - Time: `created_at`, `updated_at`, `last_active`, `last_breath_at`
 - Emotion: `valence` (0-1), `arousal` (0-1)
 - Lifecycle: `pinned`, `resolved`, `digested`
-- Retrieval: `embedding` (BLOB, bge-m3 1024-dim float32)
+- Retrieval: `embedding` (BLOB, qwen3-embedding:4b 2560-dim float32)
 - Activation: `activation_count` (REAL, bumped on retrieval/breath)
 
 `memories_fts` is an FTS5 virtual table auto-maintaining the keyword index over `key + content`.
@@ -188,7 +205,7 @@ The decay score formula lives in `_calc_decay_score()` in [memory_mcp.py](memory
 ## 功能
 
 - 保存、搜索、列出、删除记忆条目
-- BM25 关键词搜索 + bge-m3 向量余弦相似度融合排序
+- BM25 关键词搜索 + qwen3-embedding:4b 向量余弦相似度融合排序
 - Ebbinghaus 衰减公式 + 情感唤醒度加权
 - 通过本地 Ollama 模型生成中文摘要 / 情感分析 / 记忆提取
 - 支持 stdio（Claude Desktop）和 Streamable HTTP（手机远程访问）两种传输
@@ -236,6 +253,23 @@ python memory_mcp.py --http --port 3456 --db ./memory.db
 | `extmcp_recall_session` | 按 `session_id` 拉出该会话的完整记忆时间轴 |
 | `extmcp_session_preview` | 速览最近几个对话的最后几条消息 |
 | `extmcp_send_to_backend` | 给后台收件箱留言；`urgent=true` 请求即时投递（agent 的注入器每 30 秒轮询，直接打进 agent 的对话流） |
+| `extmcp_get_memory` | 按 `id` / 精确 `key` / `key_prefix` 直查——走 SQL，绕开语义检索，且**不激活** activation |
+| `extmcp_set_tier` | 显式升 / 降层（promote / demote）：设置记忆的 `tier`（+ 可选 `until_days` 给 watch 设到期） |
+
+## 记忆分层（tier）
+
+每条记忆多了 `tier` 列（外加 `tier_until`），把它放进分层架构。`extmcp_save_memory` 接受可选 `tier`，`extmcp_list_memories` 可按 tier 过滤，search / list 结果都会带 tier 字段。breath 输出现已分段（PINNED / CORE / WORKING / WATCH / TOP UNRESOLVED），且每行行首带 `[id:mem_xxx]`，让曝光出来的记忆能被直接维护。
+
+| tier | 语义 | breath 行为 |
+|---|---|---|
+| `''` | 普通记忆 | 进 TOP UNRESOLVED，按 decay 分（完全向后兼容） |
+| `working` | 工作记忆（活跃 promise） | 独立段全曝光；resolved 时自动归档（tier→archive） |
+| `watch` | 观察窗（如危机记录） | 独立段带到期日；`tier_until` 到期自动降到 archive（默认 14 天） |
+| `core` | 宪法层（boundary / 协议） | 独立段，按 day-of-year 确定性轮换曝光 2 条 |
+| `archive` | 传记 / 历史层 | **永不进 breath**，检索仍可达 |
+| `seabed` | 海床（4 月批量导入） | **永不进 breath**，检索仍可达（用 `set_tier` 捞珠升层） |
+
+升层（如 seabed → 活跃层）或降层 / 结案，用 `extmcp_set_tier`；想按 breath 里的 id 或 key 核对某条而不扰动 activation，用 `extmcp_get_memory`。
 
 ## HTTP 端点
 
@@ -334,7 +368,7 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 |---|---|---|
 | `OLLAMA_BASE_URL` | Ollama 服务地址 | `http://localhost:11434` |
 | `OLLAMA_MODEL` | 摘要 / 提取用模型 | `gemma4:e4b` |
-| `OLLAMA_EMBED_MODEL` | embedding 模型 | `bge-m3` |
+| `OLLAMA_EMBED_MODEL` | embedding 模型 | `qwen3-embedding:4b` |
 | `OLLAMA_TIMEOUT` | 请求超时（秒） | `180` |
 | `DECAY_LAMBDA` | 衰减系数 | `0.05` |
 | `DECAY_THRESHOLD` | 衰减阈值 | `0.3` |
@@ -349,7 +383,7 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 - 时间：`created_at`, `updated_at`, `last_active`, `last_breath_at`
 - 情感：`valence` (0-1), `arousal` (0-1)
 - 生命周期：`pinned`, `resolved`, `digested`
-- 检索：`embedding` (BLOB, bge-m3 1024 维 float32)
+- 检索：`embedding` (BLOB, qwen3-embedding:4b 2560 维 float32)
 - 激活：`activation_count` (REAL, 被检索/呼吸时累加)
 
 `memories_fts` 是 FTS5 虚表，自动维护 `key + content` 的关键词索引。
