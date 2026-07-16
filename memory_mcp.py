@@ -2693,7 +2693,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         items = [
             {"id": r.id, "key": r.key, "content": r.content,
              "category": r.category, "importance": r.importance,
-             "updated_at": r.updated_at}
+             "tier": r.tier, "updated_at": r.updated_at}
             for r in results
         ]
         return [{"type": "text", "text": json.dumps(
