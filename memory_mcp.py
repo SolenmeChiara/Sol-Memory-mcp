@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -224,6 +224,22 @@ def _start_maintenance_daemon(store: "MemoryStore", db_path: Path) -> None:
             f"({target.stat().st_size // 1048576}MB, keeping {BACKUP_KEEP})\n"
         )
 
+    def _watch_expiry() -> None:
+        """Auto-cool expired watch-tier memories down to archive. Runs on the
+        (hourly) maintenance tick; idempotent, cheap, indexed by idx_memories_tier."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with store._lock:
+            cur = store.conn.execute(
+                "UPDATE memories SET tier='archive', tier_until='' "
+                "WHERE tier='watch' AND tier_until != '' AND tier_until < ?",
+                (now_iso,),
+            )
+            store.conn.commit()
+            n = cur.rowcount
+        if n > 0:
+            sys.stderr.write(f"[maint] watch expiry: {n} memories cooled watch→archive\n")
+            sys.stderr.flush()
+
     def _loop() -> None:
         # Eager pass shortly after startup (inside the thread so a ~400MB
         # backup copy never blocks server startup), then hourly.
@@ -236,6 +252,10 @@ def _start_maintenance_daemon(store: "MemoryStore", db_path: Path) -> None:
                 _backup()  # no-op if today's file exists
             except Exception as exc:
                 sys.stderr.write(f"[maint-daemon] backup error: {exc}\n")
+            try:
+                _watch_expiry()
+            except Exception as exc:
+                sys.stderr.write(f"[maint-daemon] watch-expiry error: {exc}\n")
             _time_mod.sleep(WAL_CHECKPOINT_INTERVAL_HOURS * 3600)
 
     threading.Thread(target=_loop, daemon=True, name="maint-daemon").start()
@@ -343,6 +363,19 @@ def _calc_decay_score(rec) -> float:
 BREATH_TOKEN_BUDGET = int(os.environ.get("BREATH_TOKEN_BUDGET", "3000"))
 BREATH_PINNED_QUOTA = int(os.environ.get("BREATH_PINNED_QUOTA", "2"))
 
+# ---- Memory tier (layered-memory architecture) ----
+# ''       普通层（默认）
+# working  工作记忆：当下正在处理、需要频繁浮现
+# watch    观察窗：暂时挂起、到期自动降温到 archive
+# core     宪法层：长期不变的核心事实/边界，按日轮换浮现
+# archive  传记历史层：已结案/沉淀，不主动浮现但可查
+# seabed   海床：批量导入的低价值碎片，永不主动浮现
+VALID_TIERS = frozenset({"", "working", "watch", "core", "archive", "seabed"})
+BREATH_CORE_QUOTA = int(os.environ.get("BREATH_CORE_QUOTA", "2"))
+BREATH_WORKING_QUOTA = int(os.environ.get("BREATH_WORKING_QUOTA", "5"))
+BREATH_WATCH_QUOTA = int(os.environ.get("BREATH_WATCH_QUOTA", "3"))
+WATCH_DEFAULT_DAYS = int(os.environ.get("WATCH_DEFAULT_DAYS", "14"))
+
 
 def _compose_breath_output(
     store: "MemoryStore",
@@ -360,7 +393,7 @@ def _compose_breath_output(
     in the last `cooldown_hours` get +touch_weight to activation_count and a fresh
     last_breath_at timestamp. Avoids the runaway feedback Gemini & gpt5.4 both flagged.
     """
-    # 1) Pinned quota
+    # 1) Pinned quota (unchanged — pinned wins regardless of tier)
     with store._lock:
         pinned_rows = store.conn.execute(
             "SELECT * FROM memories WHERE pinned=1 AND memory_kind='long_term' "
@@ -369,18 +402,56 @@ def _compose_breath_output(
         ).fetchall()
     pinned_recs = [store._row_to_record(r) for r in pinned_rows]
 
-    # 2) Unresolved candidate pool
+    # 2) CORE tier — constitutional layer, deterministic day-of-year rotation.
+    #    Read-only rotation (no DB writes) so the do_touch=False /breath-hook
+    #    path rotates identically to the tool path.
+    with store._lock:
+        core_rows = store.conn.execute(
+            "SELECT * FROM memories WHERE tier='core' AND resolved=0 AND digested=0 "
+            "AND pinned=0 AND memory_kind='long_term' ORDER BY id"
+        ).fetchall()
+    core_all = [store._row_to_record(r) for r in core_rows]
+    if len(core_all) > BREATH_CORE_QUOTA:
+        doy = datetime.now(timezone.utc).timetuple().tm_yday
+        offset = doy % len(core_all)
+        core_recs = [core_all[(offset + k) % len(core_all)] for k in range(BREATH_CORE_QUOTA)]
+    else:
+        core_recs = core_all
+
+    # 3) WORKING tier — active working memory, most-recent first.
+    with store._lock:
+        working_rows = store.conn.execute(
+            "SELECT * FROM memories WHERE tier='working' AND resolved=0 AND digested=0 "
+            "AND pinned=0 AND memory_kind='long_term' ORDER BY updated_at DESC"
+        ).fetchall()
+    working_all = [store._row_to_record(r) for r in working_rows]
+    working_total = len(working_all)
+    working_recs = working_all[:BREATH_WORKING_QUOTA]
+
+    # 4) WATCH tier — parked-with-expiry, most-recent first.
+    with store._lock:
+        watch_rows = store.conn.execute(
+            "SELECT * FROM memories WHERE tier='watch' AND resolved=0 AND digested=0 "
+            "AND pinned=0 AND memory_kind='long_term' ORDER BY updated_at DESC LIMIT ?",
+            (BREATH_WATCH_QUOTA,),
+        ).fetchall()
+    watch_recs = [store._row_to_record(r) for r in watch_rows]
+
+    # 5) TOP UNRESOLVED candidate pool (existing logic). Tier filter added so
+    #    working/watch (own segments above) and archive/seabed (never surfaced)
+    #    stay out — this is the fix for the "ghost memory" leak.
     with store._lock:
         un_rows = store.conn.execute(
             "SELECT * FROM memories WHERE resolved=0 AND pinned=0 AND digested=0 "
-            "AND memory_kind='long_term' ORDER BY updated_at DESC LIMIT 200"
+            "AND memory_kind='long_term' AND COALESCE(tier,'')='' "
+            "ORDER BY updated_at DESC LIMIT 200"
         ).fetchall()
     un_recs = [store._row_to_record(r) for r in un_rows]
     for rec in un_recs:
         rec.decay_score = _calc_decay_score(rec)
     un_recs.sort(key=lambda x: x.decay_score, reverse=True)
 
-    # 3) Cheap dedupe: same key+date keeps only highest decay_score
+    # Cheap dedupe: same key+date keeps only highest decay_score
     seen: dict[tuple[str, str], bool] = {}
     deduped: list = []
     for rec in un_recs:
@@ -394,7 +465,7 @@ def _compose_breath_output(
     un_quota = max(1, limit - len(pinned_recs))
     un_pool = deduped[: un_quota * 2]
 
-    # 4) Diversity: top1 fixed, rest shuffled (so the same #2 doesn't always lead)
+    # Diversity: top1 fixed, rest shuffled (so the same #2 doesn't always lead)
     if len(un_pool) > 1:
         head, tail = un_pool[:1], un_pool[1:]
         random.shuffle(tail)
@@ -402,37 +473,55 @@ def _compose_breath_output(
     else:
         un_picked = un_pool[:un_quota]
 
-    # 5) Format with token budget (rough: 1 char ≈ 1 token for CJK; whitespace flattened)
+    # 6) Format with token budget (rough: 1 char ≈ 1 token for CJK; whitespace flattened)
     def _fmt(rec, weight_str: str) -> str:
         flat = " ".join((rec.content or "").split())
-        return f"[weight:{weight_str} V{rec.valence:.1f}/A{rec.arousal:.1f}] {rec.key}: {flat}"
+        return (
+            f"[id:{rec.id}] [weight:{weight_str} "
+            f"V{rec.valence:.1f}/A{rec.arousal:.1f}] {rec.key}: {flat}"
+        )
 
     lines: list[str] = []
     used = 0
     referenced: list[str] = []
 
-    if pinned_recs:
-        lines.append("=== PINNED ===")
-        for rec in pinned_recs:
-            line = _fmt(rec, "999.00")
+    def _emit_segment(header: str, recs: list, weight_of, suffix_of=None) -> None:
+        """Append a segment (header + rows) respecting the token budget.
+        Empty `recs` skips the whole segment (header included)."""
+        nonlocal used
+        if not recs:
+            return
+        if used + len(header) > BREATH_TOKEN_BUDGET:
+            return
+        lines.append(header)
+        used += len(header)
+        for rec in recs:
+            line = _fmt(rec, weight_of(rec))
+            if suffix_of is not None:
+                line += suffix_of(rec)
             if used + len(line) > BREATH_TOKEN_BUDGET:
                 break
             lines.append(line)
             used += len(line)
             referenced.append(rec.id)
 
-    if un_picked:
-        header = "\n=== TOP UNRESOLVED (by decay) ==="
-        if used + len(header) <= BREATH_TOKEN_BUDGET:
-            lines.append(header)
-            used += len(header)
-            for rec in un_picked:
-                line = _fmt(rec, f"{rec.decay_score:.2f}")
-                if used + len(line) > BREATH_TOKEN_BUDGET:
-                    break
-                lines.append(line)
-                used += len(line)
-                referenced.append(rec.id)
+    def _decay_w(rec) -> str:
+        if rec.decay_score <= 0.0:
+            rec.decay_score = _calc_decay_score(rec)
+        return f"{rec.decay_score:.2f}"
+
+    def _watch_suffix(rec) -> str:
+        tu = rec.tier_until or ""
+        return f" (watch until {tu[5:10]})" if len(tu) >= 10 else ""
+
+    _emit_segment("=== PINNED ===", pinned_recs, lambda r: "999.00")
+    _emit_segment("\n=== CORE ===", core_recs, _decay_w)
+    working_header = "\n=== WORKING ==="
+    if working_total > BREATH_WORKING_QUOTA:
+        working_header = f"\n=== WORKING ({len(working_recs)}/{working_total}) ==="
+    _emit_segment(working_header, working_recs, _decay_w)
+    _emit_segment("\n=== WATCH ===", watch_recs, _decay_w, suffix_of=_watch_suffix)
+    _emit_segment("\n=== TOP UNRESOLVED (by decay) ===", un_picked, _decay_w)
 
     text = "\n".join(lines)
 
@@ -502,6 +591,8 @@ class MemoryRecord:
     digested: bool = False
     activation_count: float = 1.0
     last_active: str = ""
+    tier: str = ""
+    tier_until: str = ""
     final_score: float = 0.0
     vector_score: float = 0.0
     keyword_score: float = 0.0
@@ -596,6 +687,8 @@ class MemoryStore:
                 ("last_active",      "TEXT DEFAULT ''"),
                 ("last_breath_at",   "TEXT DEFAULT ''"),  # cooldown for breath-induced touch
                 ("consolidated",     "INTEGER DEFAULT 0"),  # marks merge-products; excluded from future consolidate runs
+                ("tier",             "TEXT DEFAULT ''"),   # layered-memory tier (see VALID_TIERS)
+                ("tier_until",       "TEXT DEFAULT ''"),   # watch-tier expiry (UTC ISO); empty = no expiry
             ]
             for col_name, col_def in _NEW_COLS:
                 if col_name not in columns:
@@ -633,15 +726,11 @@ class MemoryStore:
                         f"ALTER TABLE phone_status ADD COLUMN {col_name} {col_def}"
                     )
             # urgent messages bypass the wakeup cycle: the injector's sleep
-            # loop polls for them and tmux-injects straight into CC's chat
-            inbox_cols = {
-                r[1] for r in self.conn.execute("PRAGMA table_info(backend_inbox)")
-            }
-            if "priority" not in inbox_cols:
-                self.conn.execute(
-                    "ALTER TABLE backend_inbox "
-                    "ADD COLUMN priority TEXT DEFAULT 'normal'"
-                )
+            # loop polls for them and tmux-injects straight into CC's chat.
+            # NB: the table must be created *before* the PRAGMA/ALTER migration
+            # below, otherwise a fresh database dies on "no such table" (the
+            # ALTER used to run first — harmless on the production db which
+            # already had the table, fatal on any new/test db).
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS backend_inbox (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -652,6 +741,14 @@ class MemoryStore:
                     seen_at TEXT
                 )
             """)
+            inbox_cols = {
+                r[1] for r in self.conn.execute("PRAGMA table_info(backend_inbox)")
+            }
+            if "priority" not in inbox_cols:
+                self.conn.execute(
+                    "ALTER TABLE backend_inbox "
+                    "ADD COLUMN priority TEXT DEFAULT 'normal'"
+                )
             # Event stream from iOS Shortcuts automations (alarm stopped,
             # sleep focus on/off, wifi join, charging...). Unlike phone_status
             # (a snapshot that answers "how are things now"), each row is a
@@ -664,6 +761,18 @@ class MemoryStore:
                     detail TEXT
                 )
             """)
+            # Indexes for the layered-memory architecture: tier-segment queries
+            # (breath), and direct id/key/prefix lookups (extmcp_get_memory /
+            # extmcp_set_tier bypass semantic search).
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)"
+            )
             self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -914,15 +1023,23 @@ class MemoryStore:
             self._mark_emb_dirty()
         return cur.rowcount > 0
 
-    def list_memories(self, limit: int = 50, memory_kind: str = "long_term") -> List[MemoryRecord]:
+    def list_memories(
+        self,
+        limit: int = 50,
+        memory_kind: str = "long_term",
+        tier: Optional[str] = None,
+    ) -> List[MemoryRecord]:
         # digested rows are archived merge-source fragments — they exist for
         # audit/recall_session but should not surface in normal listings.
+        sql = "SELECT * FROM memories WHERE memory_kind = ? AND digested = 0"
+        params: list[Any] = [memory_kind]
+        if tier is not None:
+            sql += " AND COALESCE(tier,'') = ?"
+            params.append(tier)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
         with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM memories WHERE memory_kind = ? AND digested = 0 "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (memory_kind, limit),
-            ).fetchall()
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
         return [self._row_to_record(r) for r in rows]
 
     def random_memories(self, count: int, memory_kind: str = "long_term") -> List[MemoryRecord]:
@@ -1129,6 +1246,8 @@ class MemoryStore:
             digested=bool(int(_get("digested", 0) or 0)),
             activation_count=float(_get("activation_count", 1.0) or 1.0),
             last_active=str(_get("last_active", "") or ""),
+            tier=str(_get("tier", "") or ""),
+            tier_until=str(_get("tier_until", "") or ""),
         )
 
 
@@ -1876,7 +1995,13 @@ def _parse_json_list(raw: str) -> list:
 TOOLS = [
     {
         "name": "extmcp_save_memory",
-        "description": "Save or update a memory record. Persist preferences, events, facts, or anything worth remembering long-term. Embedding and emotion analysis run in the background automatically.",
+        "description": (
+            "Save or update a memory record. Persist preferences, events, facts, or anything "
+            "worth remembering long-term. Embedding and emotion analysis run in the background "
+            "automatically. Optional `tier` places the memory in the layered-memory architecture "
+            "(working/watch/core/archive/seabed; '' = ordinary). On update, an omitted `tier` "
+            "keeps the existing tier. Resolving a `working` memory auto-archives it (tier→archive)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1894,6 +2019,16 @@ TOOLS = [
                 "pinned": {"type": "boolean", "description": "Pin memory permanently (forces importance=1.0, decay_score=999)"},
                 "resolved": {"type": "boolean", "description": "Mark as resolved (reduces decay weight by 95%)"},
                 "digested": {"type": "boolean", "description": "Mark as digested (combined with resolved: reduces decay by 98%)"},
+                "tier": {
+                    "type": "string",
+                    "enum": ["", "working", "watch", "core", "archive", "seabed"],
+                    "description": (
+                        "Layered-memory tier. working=active focus, watch=parked-with-expiry, "
+                        "core=constitutional, archive=biography/closed, seabed=low-value flood. "
+                        "Omit to keep the current tier on update. Use extmcp_set_tier for "
+                        "promote/demote with a watch expiry window."
+                    ),
+                },
             },
             "required": ["key", "content"],
         },
@@ -1937,6 +2072,11 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Include full content and emotion fields (default false)",
                 },
+                "tier": {
+                    "type": "string",
+                    "enum": ["", "working", "watch", "core", "archive", "seabed"],
+                    "description": "Optional: only list memories in this tier ('' = ordinary/untiered).",
+                },
             },
         },
     },
@@ -1949,6 +2089,59 @@ TOOLS = [
                 "id": {"type": "string", "description": "Memory ID to delete"},
             },
             "required": ["id"],
+        },
+    },
+    {
+        "name": "extmcp_get_memory",
+        "description": (
+            "Fetch full memory record(s) by exact id / key / key-prefix — a direct SQL "
+            "lookup that bypasses semantic search entirely. Give it any id or key you saw "
+            "in a breath / dream / search result (every breath line is prefixed with "
+            "[id:...]) and it returns the complete row(s): content, tier, tier_until, "
+            "importance, pinned/resolved/digested, valence/arousal, timestamps, decay_score. "
+            "Read-only — it does NOT touch/activate the memory (this is the maintenance "
+            "read path for the layered-memory / ghost-memory workflows). "
+            "Provide at least one of id, key, key_prefix (priority id > key > key_prefix); "
+            "returns up to 10 records."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Exact memory ID"},
+                "key": {"type": "string", "description": "Exact key match"},
+                "key_prefix": {"type": "string", "description": "Key prefix match (LIKE 'prefix%')"},
+            },
+        },
+    },
+    {
+        "name": "extmcp_set_tier",
+        "description": (
+            "Promote / demote a memory between layered-memory tiers with a narrow, "
+            "surgical UPDATE (never rewrites the row, so embedding / activation / emotion "
+            "are all preserved). Use it to fish a memory up from the seabed "
+            "(seabed→working or seabed→'' ordinary), file a closed thread away "
+            "(→archive), park something with an auto-expiry (→watch, cooled to archive "
+            "after `until_days`), or elevate a lasting fact (→core, rotated into breath by day). "
+            "tier='' returns the memory to the ordinary layer."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Memory ID to re-tier"},
+                "tier": {
+                    "type": "string",
+                    "enum": ["", "working", "watch", "core", "archive", "seabed"],
+                    "description": "Target tier ('' = ordinary layer)",
+                },
+                "until_days": {
+                    "type": "integer",
+                    "description": (
+                        "Only meaningful for tier='watch': days until auto-cool to archive "
+                        f"(default {WATCH_DEFAULT_DAYS}). Ignored/cleared for other tiers."
+                    ),
+                },
+            },
+            "required": ["id", "tier"],
         },
     },
     {
@@ -2118,12 +2311,60 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         valence = float(user_valence) if user_valence is not None else 0.5
         arousal = float(user_arousal) if user_arousal is not None else 0.3
 
+        user_tier = args.get("tier")
+        if user_tier is not None:
+            user_tier = str(user_tier).strip()
+            if user_tier not in VALID_TIERS:
+                raise ValueError(
+                    f"invalid tier: {user_tier!r} (valid: {sorted(VALID_TIERS)})"
+                )
+
+        # Read the pre-existing tier so it survives the upsert's full-row
+        # overwrite: upsert_memory deliberately does NOT touch tier/tier_until,
+        # so on update the old tier is preserved and on insert it defaults to ''.
+        existing_rec = store.get_memory(memory_id)
+        prev_tier = existing_rec.tier if existing_rec else ""
+        prev_tier_until = existing_rec.tier_until if existing_rec else ""
+
         rec = store.upsert_memory(
             memory_id=memory_id, key=key, content=content,
             category=category, importance=importance,
             pinned=pinned, resolved=resolved, digested=digested,
             valence=valence, arousal=arousal,
         )
+
+        # ---- tier resolution (narrow write, never through upsert) ----
+        final_tier = user_tier if user_tier is not None else prev_tier
+        final_until = prev_tier_until
+        auto_archived = False
+        # Auto-archive: resolving a working memory closes the loop → biography.
+        if resolved and final_tier == "working":
+            final_tier = "archive"
+            final_until = ""
+            auto_archived = True
+
+        need_tier_write = auto_archived or (
+            user_tier is not None and user_tier != prev_tier
+        )
+        if need_tier_write:
+            if final_tier == "watch":
+                # keep an existing watch expiry, else stamp the default window
+                if not (prev_tier == "watch" and prev_tier_until):
+                    final_until = (
+                        datetime.now(timezone.utc)
+                        + timedelta(days=WATCH_DEFAULT_DAYS)
+                    ).isoformat()
+                else:
+                    final_until = prev_tier_until
+            else:
+                final_until = ""
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with store._lock:
+                store.conn.execute(
+                    "UPDATE memories SET tier=?, tier_until=?, updated_at=? WHERE id=?",
+                    (final_tier, final_until, now_iso, memory_id),
+                )
+                store.conn.commit()
 
         do_emotion = (user_valence is None or user_arousal is None)
 
@@ -2154,13 +2395,17 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         threading.Thread(target=_bg_update, args=(memory_id, content, do_emotion), daemon=True).start()
 
         ds = _calc_decay_score(rec)
+        note = "embedding & emotion analysis running in background"
+        if auto_archived:
+            note = "working 记忆已结案，自动归档 (tier→archive)；" + note
         return [{"type": "text", "text": json.dumps({
             "ok": True, "id": rec.id, "key": rec.key,
             "category": rec.category, "importance": rec.importance,
             "valence": rec.valence, "arousal": rec.arousal,
             "pinned": rec.pinned, "resolved": rec.resolved,
+            "tier": final_tier, "tier_until": final_until,
             "decay_score": ds,
-            "note": "embedding & emotion analysis running in background",
+            "note": note,
         }, ensure_ascii=False)}]
 
     elif name == "extmcp_search_memory":
@@ -2179,7 +2424,8 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 "session_id": r.session_id,
                 "score": round(r.final_score, 4),
                 "valence": r.valence, "arousal": r.arousal,
-                "pinned": r.pinned, "decay_score": _calc_decay_score(r),
+                "pinned": r.pinned, "tier": r.tier,
+                "decay_score": _calc_decay_score(r),
             }
             for r in results
         ]
@@ -2208,7 +2454,15 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
     elif name == "extmcp_list_memories":
         limit = max(1, min(100, int(args.get("limit", 20) or 20)))
         full = bool(args.get("full", False))
-        results = store.list_memories(limit=limit)
+        tier_arg = args.get("tier")
+        tier_filter = None
+        if tier_arg is not None:
+            tier_filter = str(tier_arg).strip()
+            if tier_filter not in VALID_TIERS:
+                raise ValueError(
+                    f"invalid tier: {tier_filter!r} (valid: {sorted(VALID_TIERS)})"
+                )
+        results = store.list_memories(limit=limit, tier=tier_filter)
         if full:
             items = [
                 {
@@ -2216,7 +2470,8 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                     "category": r.category, "importance": r.importance,
                     "updated_at": r.updated_at,
                     "valence": r.valence, "arousal": r.arousal,
-                    "pinned": r.pinned, "decay_score": _calc_decay_score(r),
+                    "pinned": r.pinned, "tier": r.tier,
+                    "decay_score": _calc_decay_score(r),
                 }
                 for r in results
             ]
@@ -2228,12 +2483,14 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                     "id": r.id, "key": r.key, "category": r.category,
                     "updated_at": r.updated_at,
                     "decay_score": _calc_decay_score(r),
-                    "pinned": r.pinned,
+                    "pinned": r.pinned, "tier": r.tier,
                 }
                 for r in results
             ]
         return [{"type": "text", "text": json.dumps(
-            {"count": len(items), "full": full, "items": items}, ensure_ascii=False,
+            {"count": len(items), "full": full,
+             "tier_filter": tier_filter, "items": items},
+            ensure_ascii=False,
         )}]
 
     elif name == "extmcp_delete_memory":
@@ -2242,6 +2499,83 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             raise ValueError("id is required")
         deleted = store.delete_memory(memory_id)
         return [{"type": "text", "text": json.dumps({"ok": deleted, "id": memory_id}, ensure_ascii=False)}]
+
+    elif name == "extmcp_get_memory":
+        mem_id = str(args.get("id", "") or "").strip()
+        key = str(args.get("key", "") or "").strip()
+        key_prefix = str(args.get("key_prefix", "") or "").strip()
+        if not (mem_id or key or key_prefix):
+            raise ValueError("provide at least one of: id, key, key_prefix")
+        # Priority id > key > key_prefix. Direct SQL, no touch/activation.
+        if mem_id:
+            where, params = "id = ?", (mem_id,)
+        elif key:
+            where, params = "key = ?", (key,)
+        else:
+            where, params = "key LIKE ?", (key_prefix + "%",)
+        with store._lock:
+            rows = store.conn.execute(
+                f"SELECT * FROM memories WHERE {where} "
+                "ORDER BY updated_at DESC LIMIT 10",
+                params,
+            ).fetchall()
+        recs = [store._row_to_record(r) for r in rows]
+        items = [
+            {
+                "id": r.id, "key": r.key, "content": r.content,
+                "category": r.category, "tier": r.tier, "tier_until": r.tier_until,
+                "importance": r.importance, "pinned": r.pinned,
+                "resolved": r.resolved, "digested": r.digested,
+                "valence": r.valence, "arousal": r.arousal,
+                "created_at": r.created_at, "updated_at": r.updated_at,
+                "decay_score": _calc_decay_score(r),
+            }
+            for r in recs
+        ]
+        return [{"type": "text", "text": json.dumps(
+            {"count": len(items), "items": items}, ensure_ascii=False,
+        )}]
+
+    elif name == "extmcp_set_tier":
+        memory_id = str(args.get("id", "") or "").strip()
+        if not memory_id:
+            raise ValueError("id is required")
+        tier = args.get("tier")
+        if tier is None:
+            raise ValueError("tier is required")
+        tier = str(tier).strip()
+        if tier not in VALID_TIERS:
+            raise ValueError(
+                f"invalid tier: {tier!r} (valid: {sorted(VALID_TIERS)})"
+            )
+        # tier_until only meaningful for watch; cleared otherwise.
+        tier_until = ""
+        if tier == "watch":
+            until_days = args.get("until_days")
+            days = WATCH_DEFAULT_DAYS if until_days is None else int(until_days)
+            tier_until = (
+                datetime.now(timezone.utc) + timedelta(days=days)
+            ).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Narrow UPDATE — never through upsert_memory (which overwrites the whole
+        # row and would clobber embedding / activation / emotion).
+        with store._lock:
+            cur = store.conn.execute(
+                "UPDATE memories SET tier=?, tier_until=?, updated_at=? WHERE id=?",
+                (tier, tier_until, now_iso, memory_id),
+            )
+            store.conn.commit()
+            found = cur.rowcount > 0
+        rec = store.get_memory(memory_id)
+        if not found or rec is None:
+            return [{"type": "text", "text": json.dumps(
+                {"ok": False, "error": f"memory not found: {memory_id}"},
+                ensure_ascii=False,
+            )}]
+        return [{"type": "text", "text": json.dumps({
+            "ok": True, "id": rec.id, "key": rec.key,
+            "tier": rec.tier, "tier_until": rec.tier_until,
+        }, ensure_ascii=False)}]
 
     elif name == "extmcp_summarize_recent":
         import traceback as _tb
@@ -2409,8 +2743,23 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             for mid in best_pair:
                 if mid in rec_map:
                     r = rec_map[mid]
-                    lines.append(f"**{r.key}** [V{r.valence:.2f}/A{r.arousal:.2f} decay={r.decay_score:.4f}]")
+                    lines.append(
+                        f"**{r.key}** id={r.id} "
+                        f"[V{r.valence:.2f}/A{r.arousal:.2f} decay={r.decay_score:.4f}]"
+                    )
                     lines.append(f"> {r.content[:400]}\n")
+            # Actionable suggestion for the pair (ids included so it can be acted on)
+            r1 = rec_map.get(best_pair[0])
+            r2 = rec_map.get(best_pair[1])
+            if best_sim > 0.85:
+                suggestion = "merge"
+            elif r1 and r2 and (r1.resolved != r2.resolved):
+                suggestion = "同步 resolve"
+            else:
+                suggestion = "keep"
+            lines.append(
+                f"→ 建议: {suggestion} | ids: {best_pair[0]}, {best_pair[1]}\n"
+            )
             lines.append(
                 "> 这两条记忆在语义上紧密相连，可以考虑整合、标记 resolved，"
                 "或用 extmcp_save_memory 写下新的感受。\n"
