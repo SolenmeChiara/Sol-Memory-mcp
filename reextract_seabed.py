@@ -200,6 +200,24 @@ class RetryableError(Exception):
         self.retry_after = retry_after
 
 
+def _is_transient_error(msg: str, code: Any) -> bool:
+    """Classify a top-level OpenRouter error payload as retryable or permanent.
+
+    Retryable: HTTP-ish rate-limit / 5xx codes, or phrasing that signals a
+    temporary provider condition. Permanent (e.g. Gemini PROHIBITED_CONTENT,
+    code 400) falls through to a recorded failure — retrying can't fix it."""
+    if isinstance(code, int) and code in RETRYABLE_HTTP:
+        return True
+    lower = (msg or "").lower()
+    return any(
+        k in lower
+        for k in (
+            "rate limit", "rate-limit", "overload", "timeout", "temporarily",
+            "unavailable", "try again", "please retry",
+        )
+    )
+
+
 def _call_openrouter(prompt: str) -> Tuple[str, Dict[str, int]]:
     """One OpenRouter chat/completions call. Returns (text, usage_dict).
 
@@ -251,18 +269,56 @@ def _call_openrouter(prompt: str) -> Tuple[str, Dict[str, int]]:
         raise RetryableError(f"network: {type(exc).__name__}: {exc}") from None
 
     parsed = json.loads(body)
-    choice = parsed["choices"][0]
-    finish_reason = choice.get("finish_reason", "stop")
-    content = choice["message"]["content"]
+
+    # OpenRouter can return HTTP 200 with a top-level error payload and NO
+    # 'choices' key — most commonly a Gemini content-policy block:
+    #   {"error":{"message":"Gemini blocked the request: PROHIBITED_CONTENT","code":400}}
+    # (Reading parsed["choices"][0] here used to raise a raw KeyError.)
+    err = parsed.get("error")
+    if err:
+        if isinstance(err, dict):
+            msg = str(err.get("message", err))
+            code = err.get("code")
+        else:
+            msg, code = str(err), None
+        if _is_transient_error(msg, code):
+            raise RetryableError(f"OpenRouter error (code={code}): {msg}")
+        raise RuntimeError(f"OpenRouter error (code={code}): {msg}")
+
+    choices = parsed.get("choices") or []
+    if not choices:
+        raise RetryableError(f"OpenRouter returned no choices: {json.dumps(parsed)[:200]}")
+    choice = choices[0] or {}
+    finish_reason = choice.get("finish_reason") or "stop"
+    # message / content can each be null (Gemini content_filter, or a transient
+    # blip). Never call .strip() on a None downstream — coerce/classify here.
+    content = (choice.get("message") or {}).get("content")
+
     usage = parsed.get("usage", {}) or {}
     usage = {
         "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
         "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
     }
+
+    # Provider blocked the content (Gemini safety). Deterministic — don't retry;
+    # surface it so the few blocked conversations are recorded (and visible to
+    # Sol) rather than crashing the worker on a null content or being dropped.
+    if finish_reason == "content_filter":
+        raise RuntimeError(
+            f"content blocked by provider (finish_reason=content_filter): "
+            f"{str(content)[:120]}"
+        )
     if finish_reason == "length":
         raise RuntimeError(
             "LLM output truncated by max_tokens — conversation produced more than "
             f"{OPENROUTER_MAX_TOKENS} tokens of memories; raise REEXTRACT_MAX_TOKENS."
+        )
+    if content is None:
+        # Null content without an explicit block/length reason is almost always a
+        # transient provider glitch (idx 1249/1916 in the full run returned valid
+        # content on the next call) — retry rather than crash or silently skip.
+        raise RetryableError(
+            f"provider returned null content (finish_reason={finish_reason!r})"
         )
     return content, usage
 
