@@ -183,6 +183,14 @@ The `/breath-hook` endpoint itself is **read-only** and never activates memories
 | `BREATH_TOKEN_BUDGET` | breath output length budget | `3000` |
 | `BREATH_PINNED_QUOTA` | pinned quota within breath | `2` |
 
+### Bring your own embedding model (required)
+
+Semantic recall, `extmcp_dream`, and breath ranking all run on **vector similarity**, so the server needs a local embedding model — it will not embed anything without one. Recommended: Ollama + `qwen3-embedding:4b` (`ollama pull qwen3-embedding:4b`). Other models work too (`bge-m3`, `nomic-embed-text`, …) — set `OLLAMA_EMBED_MODEL` to its name. The first-run wizard probes `/api/tags` and warns you if no embedding model is present. **Switching embedding models changes the vector dimension, so you must re-embed the whole store afterwards** (`python reindex_embeddings.py --fix-dims`).
+
+### Cloud-parse failover & web merge
+
+The cloud-parse path (session consolidation / extraction) auto-fails-over between backends: whichever side `LLM_BACKEND` prefers is tried first, and an **infrastructure** error (connection refused, timeout, 401/403, missing key) transparently retries on the other side — a **content/policy 400 does not** trigger a switch (the other backend would reject it too). The web import page's **合并 Session** button follows suit: it runs on the cloud model when a key is set, or on the local Ollama model when there's no key but Ollama is reachable (with a quality-warning banner and no cost estimate for the local path).
+
 ## Database schema
 
 Key columns of the `memories` table:
@@ -384,6 +392,14 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 | `DECAY_THRESHOLD` | 衰减阈值 | `0.3` |
 | `BREATH_TOKEN_BUDGET` | breath 输出字数预算 | `3000` |
 | `BREATH_PINNED_QUOTA` | breath 中 pinned 配额 | `2` |
+
+### 必须自备 embedding 模型
+
+语义检索、`extmcp_dream`、breath 排序全靠**向量相似度**，所以服务器必须挂一个本地 embedding 模型——没有它就不会生成任何向量。推荐 Ollama + `qwen3-embedding:4b`（`ollama pull qwen3-embedding:4b`）。也可用别的（`bge-m3`、`nomic-embed-text` 等），把 `OLLAMA_EMBED_MODEL` 设成对应名字即可。首启向导会探 `/api/tags`，没检测到 embedding 模型会明确提醒。**换 embedding 模型会改变向量维度，换完必须全量重嵌**（`python reindex_embeddings.py --fix-dims`）。
+
+### 解析通道双向兜底 & 网页合并
+
+云端解析（session 合并 / 提取）会在两侧后端间自动兜底：先试 `LLM_BACKEND` 指定侧，遇到**基建性**故障（连接失败、超时、401/403、缺 key）自动切另一侧重试；而**内容/策略类 400 不会**触发切换（换后端也会被同样拒绝）。网页导入页的 **合并 Session** 按钮同理：配了云端 key 就走云端模型，没 key 但本地 Ollama 可达就走本地模型（此时挂质量风险提示、不再报云端费用）。
 
 ## 数据库 schema
 

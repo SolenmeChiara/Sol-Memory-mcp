@@ -1939,6 +1939,8 @@ const statsBlock=document.getElementById('statsBlock');
 const btnReindex=document.getElementById('btnReindex'),btnConsolidate=document.getElementById('btnConsolidate'),btnPrune=document.getElementById('btnPrune');
 const consolidateHint=document.getElementById('consolidateHint');
 const SIZE_LIMIT=30*1024*1024;
+// which backend the merge would use: 'cloud' | 'local' | 'none' (updated每次 refreshStats)
+let mergeMode='none';
 
 async function refreshStats(){
   try{
@@ -1962,20 +1964,20 @@ async function refreshStats(){
     btnPrune.textContent=s.digested_stale>0
       ? `清理过期归档 (${s.digested_stale})`
       : '清理过期归档';
-    if(!s.analysis_ready){
+    mergeMode = !s.analysis_ready ? 'none' : (s.openrouter_key_present ? 'cloud' : 'local');
+    if(mergeMode==='none'){
       // 没有任何解析通道：云端 key 不在，本地 ollama 也不可达
       btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
       consolidateHint.textContent='未配置云端解析通道（.env 里配 OPENROUTER_API_KEY，或启动本地 Ollama）';
-    }else if(!s.openrouter_key_present){
-      // 本地解析可用，但网页端合并走的是云端通道，仍需 key
-      btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
-      consolidateHint.textContent='网页合并走云端通道，需在 .env 配 OPENROUTER_API_KEY（本地解析可用 batch_import 离线跑）';
     }else if(s.unconsolidated_sessions_over_5===0){
       btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
       consolidateHint.textContent='没有待合并的 session';
     }else{
+      // 有通道且有待合并 session：放行。走本地小模型时挂 Sol 的风险提示。
       btnConsolidate.disabled=false;btnConsolidate.style.opacity='1';
-      consolidateHint.textContent='';
+      consolidateHint.textContent = mergeMode==='local'
+        ? '风险提示：规模较小的小模型合并质量较差，推荐使用更大质量更高的模型保证合并质量，推荐使用云端模型，或者让本记忆库的模型自行获取 session 合并'
+        : '';
     }
   }catch(e){
     statsBlock.textContent='stats 加载失败: '+e.message;
@@ -2085,7 +2087,11 @@ btnConsolidate.addEventListener('click',()=>{
   const maxFrag=prompt('只合并碎片数 ≤ N 的 session（留空=全部；建议第一次填 49 先跑短中 session）：','49');
   if(maxFrag===null)return;
   const n=parseInt(maxFrag)||0;
-  if(!confirm('启动 session 合并任务？将调用 OpenRouter（Gemini 3.1 Flash Lite），预计成本 $1-6。')) return;
+  // 成本提示按实际后端渲染：本地 ollama 不花钱，云端才报 $。
+  const msg = mergeMode==='local'
+    ? '启动 session 合并任务？将用本地 Ollama 模型（无云端费用；小模型合并质量偏低）。确定？'
+    : '启动 session 合并任务？将调用 OpenRouter（Gemini 3.1 Flash Lite），预计成本 $1-6。';
+  if(!confirm(msg)) return;
   startAdminTask('consolidate',{min_fragments:5,max_fragments:n,workers:2});
 });
 
@@ -4005,11 +4011,21 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
             self._send_json(200, {"ok": True, "deleted": n, "threshold_days": days})
 
         def _handle_admin_consolidate(self) -> None:
-            """POST /admin/consolidate — kick off consolidate_sessions in the background."""
-            if not os.environ.get("OPENROUTER_API_KEY"):
+            """POST /admin/consolidate — kick off consolidate_sessions in the background.
+
+            Cloud key present → cloud (with mid-run failover to ollama). No cloud
+            key but ollama reachable → run locally on ollama. Neither → 400.
+            """
+            has_key = bool(os.environ.get("OPENROUTER_API_KEY"))
+            if has_key:
+                backend = None  # env default (openrouter); call_llm fails over if it dies
+            elif _ollama_reachable():
+                backend = "ollama"  # no cloud key, but the local model can still merge
+            else:
                 self._send_json(400, {
                     "ok": False,
-                    "error": "OPENROUTER_API_KEY not set. Add it to .env (next to memory.db) and restart the server.",
+                    "error": "没有可用的解析通道：未配置 OPENROUTER_API_KEY，本地 Ollama 也不可达。"
+                             "请检查 .env 里的 URL 和 key，或启动 Ollama。",
                 })
                 return
 
@@ -4028,6 +4044,7 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                 "workers": max(1, min(4, int(data.get("workers", 2) or 2))),
                 "limit": max(0, int(data.get("limit", 0) or 0)),
                 "dry_run": bool(data.get("dry_run", False)),
+                "backend": backend,
             }
             task = _start_admin_task(store, "consolidate", run_consolidate, kwargs)
             self._send_json(200, {"ok": True, "async": True, "task_id": task["id"]})
@@ -4298,7 +4315,7 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
 
 def main() -> None:
     import argparse
-    global OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT, SUMMARIZE_DRY_RUN
+    global OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_EMBED_MODEL, OLLAMA_TIMEOUT, SUMMARIZE_DRY_RUN
 
     # Subcommand mode: `python memory_mcp.py breath [--limit N] [--db PATH]`
     # Used by SessionStart hook as a fallback when HTTP server isn't running.
@@ -4367,6 +4384,10 @@ def main() -> None:
         OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", OLLAMA_MODEL)
     if args.ollama_timeout == parser.get_default("ollama_timeout"):
         OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", OLLAMA_TIMEOUT))
+    # No CLI flag for the embedding model, so no default-guard — always let .env
+    # win. Otherwise the wizard's non-default OLLAMA_EMBED_MODEL is ignored by the
+    # server and the embed worker mixes dimensions with reindex.
+    OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_EMBED_MODEL)
 
     store = MemoryStore(db_path)
 

@@ -22,10 +22,10 @@ import json
 import os
 import random
 import sqlite3
-import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -44,10 +44,20 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3.1-flash-l
 
 # Ollama fallback
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "120"))
 MAX_CONSECUTIVE_FAILURES = 10
+
+# call_llm failover / retry tuning
+_LLM_RETRY_MAX = 2          # same-side retries for 429/408 before failing over
+_LLM_RETRY_BASE = 2.0       # seconds — exponential backoff base
+_LLM_RETRY_CAP = 120.0      # cap any single wait (incl. Retry-After) at 2 min
+
+# Count of calls silently served by ollama after the cloud side fell over, so a
+# batch run can surface how much quietly degraded to the local model.
+_llm_fallback_lock = threading.Lock()
+_llm_fallback_to_ollama = 0
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +93,30 @@ def _call_openrouter(prompt: str) -> str:
     with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
         body = resp.read().decode("utf-8", errors="replace")
     parsed = json.loads(body)
+    # Some OpenAI-compatible gateways (OpenRouter seen doing this) answer HTTP 200
+    # with a top-level {"error": ...} instead of an HTTP status. Classify by the
+    # embedded code so failover treats it like the equivalent HTTP status — and so
+    # we never blow up on a bare KeyError('choices'). Mirrors reextract 93f508e.
+    err = parsed.get("error")
+    if err:
+        emsg = (err.get("message") if isinstance(err, dict) else str(err)) or str(err)
+        ecode = err.get("code") if isinstance(err, dict) else None
+        try:
+            ecode = int(ecode)
+        except (TypeError, ValueError):
+            ecode = None
+        if ecode in (429, 408) or (ecode is not None and ecode >= 500):
+            raise urllib.error.HTTPError(url, ecode, emsg, None, None)  # transient → retry/failover
+        raise RuntimeError(f"OpenRouter 内容/策略拒绝（code={ecode}）：{emsg}")  # content → no failover
+    if not parsed.get("choices"):
+        raise RuntimeError(f"OpenRouter 返回无 choices：{str(parsed)[:200]}")
     choice = parsed["choices"][0]
     finish_reason = choice.get("finish_reason", "stop")
     content = choice["message"]["content"]
     if finish_reason == "length":
         raise RuntimeError(
-            f"LLM output truncated by max_tokens (session too large to merge in one shot). "
-            f"Consider lowering --max-fragments or bumping max_tokens further."
+            "LLM output truncated by max_tokens (session too large to merge in one shot). "
+            "Consider lowering --max-fragments or bumping max_tokens further."
         )
     return content
 
@@ -112,13 +139,133 @@ def _call_ollama_local(prompt: str) -> str:
     return parsed["choices"][0]["message"]["content"]
 
 
+def _is_infra_error(exc: Exception) -> bool:
+    """True for 'can't reach the backend' errors that another backend might survive.
+
+    Infra: connection refused / DNS / timeout (any OSError incl. URLError), plus
+    HTTP 401/403/404/408/429/5xx (auth, wrong URL/model, rate-limit, server down).
+    NOT infra: HTTP 400 (a content/policy rejection is a per-prompt problem — the
+    other backend would reject it too), and RuntimeError (truncation / bad JSON /
+    unknown backend). Those propagate without a pointless failover.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code != 400
+    # URLError, socket.timeout(=TimeoutError), ConnectionError all subclass OSError
+    return isinstance(exc, OSError)
+
+
+def _backend_configured(name: str) -> bool:
+    """Config-level availability (not live reachability)."""
+    if name == "openrouter":
+        return bool(OPENROUTER_API_KEY)
+    if name == "ollama":
+        return True  # local, always has a default URL + model
+    return False
+
+
+def _dispatch(name: str, prompt: str) -> str:
+    return _call_openrouter(prompt) if name == "openrouter" else _call_ollama_local(prompt)
+
+
+def _http_code(exc: Exception) -> "int | None":
+    return exc.code if isinstance(exc, urllib.error.HTTPError) else None
+
+
+def _retry_after_seconds(exc: Exception) -> "float | None":
+    """Integer-seconds Retry-After header if present, capped at _LLM_RETRY_CAP."""
+    if isinstance(exc, urllib.error.HTTPError) and exc.headers:
+        ra = exc.headers.get("Retry-After")
+        if ra:
+            try:
+                return min(float(int(ra)), _LLM_RETRY_CAP)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _call_with_same_side_retry(name: str, prompt: str) -> str:
+    """Call one backend; on 429/408 back off same-side (Retry-After honoured, cap
+    120s, up to _LLM_RETRY_MAX) before giving up. Re-raises the last error so the
+    caller can then decide whether to fail over to the other side."""
+    attempt = 0
+    while True:
+        try:
+            return _dispatch(name, prompt)
+        except Exception as exc:
+            code = _http_code(exc)
+            if code in (429, 408) and attempt < _LLM_RETRY_MAX:
+                ra = _retry_after_seconds(exc)
+                delay = ra if ra is not None else min(_LLM_RETRY_BASE * (2 ** attempt), _LLM_RETRY_CAP)
+                attempt += 1
+                sys.stderr.write(
+                    f"[consolidate] {name} HTTP {code}，本侧退避 {delay:.0f}s 重试"
+                    f"（{attempt}/{_LLM_RETRY_MAX}）\n"
+                )
+                time.sleep(delay)
+                continue
+            raise
+
+
+def _note_ollama_fallback() -> None:
+    global _llm_fallback_to_ollama
+    with _llm_fallback_lock:
+        _llm_fallback_to_ollama += 1
+
+
+def fallback_count() -> int:
+    with _llm_fallback_lock:
+        return _llm_fallback_to_ollama
+
+
 def call_llm(prompt: str) -> str:
-    if LLM_BACKEND == "openrouter":
-        return _call_openrouter(prompt)
-    elif LLM_BACKEND == "ollama":
-        return _call_ollama_local(prompt)
-    else:
+    """Call the LLM_BACKEND-preferred side, auto-failing-over to the other side on
+    infrastructure errors (not on content/policy 400s). 429/408 are first retried
+    same-side with backoff (Retry-After honoured); only if they persist do we
+    switch. Logs any switch."""
+    order = {
+        "openrouter": ("openrouter", "ollama"),
+        "ollama": ("ollama", "openrouter"),
+    }.get(LLM_BACKEND)
+    if order is None:
         raise RuntimeError(f"unknown LLM_BACKEND: {LLM_BACKEND}")
+    primary, secondary = order
+
+    # If the preferred side isn't even configured (e.g. openrouter selected but no
+    # key), go straight to the other side when IT is configured.
+    if not _backend_configured(primary):
+        if _backend_configured(secondary):
+            sys.stderr.write(f"[consolidate] {primary} 未配置，改用 {secondary}\n")
+            primary, secondary = secondary, None
+        else:
+            raise RuntimeError(
+                "没有可用的解析通道：openrouter 没配 key，ollama 也不可用。"
+                "请检查 .env 里的 URL 和 key。"
+            )
+
+    try:
+        return _call_with_same_side_retry(primary, prompt)
+    except Exception as exc:
+        if not _is_infra_error(exc):
+            raise  # content / policy / truncation — switching backend won't help
+        if secondary and _backend_configured(secondary):
+            sys.stderr.write(
+                f"[consolidate] {primary} 基建性故障（{type(exc).__name__}: {exc}）→ "
+                f"自动切到 {secondary} 重试本次调用\n"
+            )
+            try:
+                out = _call_with_same_side_retry(secondary, prompt)
+            except Exception as exc2:
+                raise RuntimeError(
+                    f"两侧解析通道都拉不到（{primary}: {exc}；{secondary}: {exc2}）。"
+                    f"请检查 URL 和 key。"
+                ) from exc2
+            if secondary == "ollama":
+                _note_ollama_fallback()
+            return out
+        raise RuntimeError(
+            f"{primary} 拉不到（{type(exc).__name__}: {exc}），且没有可切换的备用通道。"
+            f"请检查 URL 和 key。"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +505,7 @@ def run_consolidate(
     workers: int = 2,
     limit: int = 0,
     dry_run: bool = False,
+    backend: "str | None" = None,
     progress_cb=None,
     stop_event: "threading.Event | None" = None,
 ) -> dict:
@@ -371,15 +519,21 @@ def run_consolidate(
     """
     # Honour .env that the caller may have set already; re-read in case web server didn't.
     _load_dotenv(db_path.parent)
-    # Module-level config may have been set by .env — pick up latest
+    # Module-level config may have been set by .env — pick up latest.
+    # An explicit `backend` arg (e.g. the web server forcing ollama when there's
+    # no cloud key) wins over the env default.
     global LLM_BACKEND, OPENROUTER_API_KEY, OPENROUTER_MODEL, OLLAMA_MODEL
-    LLM_BACKEND = os.environ.get("LLM_BACKEND", LLM_BACKEND).lower()
+    LLM_BACKEND = (backend or os.environ.get("LLM_BACKEND", LLM_BACKEND)).lower()
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
     OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", OPENROUTER_MODEL)
     OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", OLLAMA_MODEL)
 
     if LLM_BACKEND == "openrouter" and not OPENROUTER_API_KEY and not dry_run:
         raise RuntimeError("OPENROUTER_API_KEY not set (put it in .env or export it)")
+
+    # Snapshot the fallback counter so we can report how many of THIS run's calls
+    # quietly degraded to the local ollama model after the cloud side failed.
+    _fb_start = fallback_count()
 
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -418,6 +572,7 @@ def run_consolidate(
 
     if total == 0:
         state["stage"] = "done"
+        state["fallback_ollama"] = 0
         conn.close()
         _emit()
         return state
@@ -491,6 +646,12 @@ def run_consolidate(
 
     state["elapsed_s"] = time.monotonic() - t0
     state["stage"] = "aborted" if state["aborted"] else "done"
+    state["fallback_ollama"] = fallback_count() - _fb_start
+    if state["fallback_ollama"] > 0:
+        sys.stderr.write(
+            f"[consolidate] 本地兜底了 {state['fallback_ollama']} 条"
+            f"（云端拉不到时自动切到 ollama 完成的调用）\n"
+        )
     _emit()
     return state
 
@@ -585,7 +746,7 @@ def main() -> None:
     )
     if not args.dry_run and final["success"] > 0:
         sys.stderr.write(
-            f"\n提醒：新合并记忆的 embedding 留空，跑 `python reindex_embeddings.py` 补齐。\n"
+            "\n提醒：新合并记忆的 embedding 留空，跑 `python reindex_embeddings.py` 补齐。\n"
         )
     if final["aborted"]:
         sys.stderr.write(f"\n[ABORTED] {final['aborted_reason']}\n")

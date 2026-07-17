@@ -58,6 +58,10 @@ PRESETS = {
 }
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_EMBED_MODEL = "qwen3-embedding:4b"
+
+# Substrings that mark an ollama model as embedding-capable.
+EMBED_HINTS = ("embed", "bge-m3", "nomic-embed", "mxbai", "arctic-embed", "gte", "e5")
 
 
 def _reconfigure_streams() -> None:
@@ -97,11 +101,39 @@ def _mask(secret: str) -> str:
     return f"{secret[:4]}…{secret[-4:]}"
 
 
+def _probe_ollama(base_url: str) -> "tuple[bool, list]":
+    """(reachable, [model names]) via GET /api/tags. Short timeout, never raises."""
+    import json as _json
+    import urllib.request as _u
+    try:
+        req = _u.Request(base_url.rstrip("/") + "/api/tags", method="GET")
+        with _u.urlopen(req, timeout=3.0) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return False, []
+    names = [str(m.get("name", "")) for m in (data.get("models") or []) if m.get("name")]
+    return True, names
+
+
+def _find_embed_model(names: "list") -> "str | None":
+    for name in names:
+        low = name.lower()
+        if any(h in low for h in EMBED_HINTS):
+            return name
+    return None
+
+
 def _build_env(
     ollama_url: str,
     cloud: "dict | None",
+    embed_model: "str | None" = None,
+    embed_note: str = "",
 ) -> str:
-    """Render the .env text. cloud is None when the user skipped cloud parse."""
+    """Render the .env text.
+
+    cloud is None when the user skipped cloud parse. embed_model is written only
+    when it differs from the code default (qwen3-embedding:4b); embed_note is a
+    human-readable line describing what the wizard found."""
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         f"# Sol-Memory-mcp 配置（由 first_run_setup.py 生成于 {stamp}）",
@@ -109,10 +141,15 @@ def _build_env(
         "# 删掉本文件并重跑 start_http.bat 会再次触发本向导。",
         "",
         "# ---- 本地 Ollama（embedding 向量 + 轻量本地模型）----",
-        "# embedding 默认用 qwen3-embedding:4b（在代码里写死默认，无需在此声明）。",
+        "# 本记忆库必须自备 embedding 模型：没有它，语义检索 / breath 排序都不可用。",
+        f"# embedding：{embed_note}" if embed_note else "# embedding 默认用 qwen3-embedding:4b。",
         f"OLLAMA_BASE_URL={ollama_url}",
-        "",
     ]
+    if embed_model:
+        lines.append(f"OLLAMA_EMBED_MODEL={embed_model}")
+    else:
+        lines.append("# OLLAMA_EMBED_MODEL=qwen3-embedding:4b  # 代码默认，如需换模型取消注释")
+    lines.append("")
     if cloud:
         lines += [
             "# ---- 云端解析通道（OpenAI 格式 chat/completions 端点）----",
@@ -149,8 +186,36 @@ def _run_wizard() -> int:
     ollama_url = _ask("   回车用默认", DEFAULT_OLLAMA_URL)
     _p("")
 
+    # 1b) Embedding pre-check — this library CANNOT do semantic recall without one.
+    embed_model = None   # None => keep code default qwen3-embedding:4b (don't write it)
+    _p("   正在检测 Ollama 和 embedding 模型…")
+    reachable, models = _probe_ollama(ollama_url)
+    if reachable:
+        found = _find_embed_model(models)
+        if found:
+            _p(f"   ✓ Ollama 可达，检测到 embedding 模型：{found}")
+            chosen = _ask("   用它？回车确认，或输入别的模型名", found)
+            embed_note = f"使用检测到的 {chosen}"
+            if chosen != DEFAULT_EMBED_MODEL:
+                embed_model = chosen
+        else:
+            _p("   ⚠ Ollama 可达，但没发现 embedding 模型。")
+            _p("     本记忆库必须自备 embedding 模型（语义检索 / breath 排序全靠它）。")
+            _p("     推荐先拉一个：ollama pull qwen3-embedding:4b")
+            chosen = _ask("   要用的 embedding 模型名（回车用推荐默认，稍后自己 pull）", DEFAULT_EMBED_MODEL)
+            embed_note = f"计划使用 {chosen}（记得 `ollama pull {chosen}`）"
+            if chosen != DEFAULT_EMBED_MODEL:
+                embed_model = chosen
+    else:
+        _p(f"   ⚠ 连不上 Ollama（{ollama_url}）。")
+        _p("     没有 embedding，语义检索 / breath 排序等核心功能都用不了。")
+        _p("     建议装好 Ollama + embedding 模型后重跑本向导，或稍后手改 .env。")
+        embed_note = "向导运行时 Ollama 不可达——装好后请确认 OLLAMA_EMBED_MODEL（默认 qwen3-embedding:4b）"
+    _p("")
+
     # 2) Cloud-parse preset
     _p("② 云端解析 API（会话提炼 / 记忆合并用；只支持 OpenAI 格式端点）")
+    _p("   提醒：这里的模型会处理大量文本，请务必选择足够经济的模型或本地模型来运行。")
     for key in ("1", "2", "3", "4"):
         _p(f"   [{key}] {PRESETS[key]['label']}")
     _p("   [5] 自定义 URL")
@@ -185,6 +250,8 @@ def _run_wizard() -> int:
     _p("-" * 60)
     _p("即将写入 .env：")
     _p(f"  OLLAMA_BASE_URL   = {ollama_url}")
+    _p(f"  embedding 模型     = {embed_model or DEFAULT_EMBED_MODEL}"
+       + ("" if embed_model else "（代码默认）"))
     if cloud:
         _p(f"  OPENROUTER_BASE_URL = {cloud['base_url']}")
         _p(f"  OPENROUTER_MODEL    = {cloud['model']}")
@@ -193,7 +260,9 @@ def _run_wizard() -> int:
         _p("  云端解析          = 未配置（只跑本地）")
     _p("-" * 60)
 
-    ENV_PATH.write_text(_build_env(ollama_url, cloud), encoding="utf-8")
+    ENV_PATH.write_text(
+        _build_env(ollama_url, cloud, embed_model, embed_note), encoding="utf-8"
+    )
     # One-shot marker: tells the server to open the import page once, this launch.
     try:
         FIRST_RUN_MARKER.write_text("1", encoding="utf-8")
