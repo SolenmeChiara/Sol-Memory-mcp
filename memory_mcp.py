@@ -70,6 +70,16 @@ WAL_CHECKPOINT_INTERVAL_HOURS: float = float(os.environ.get("WAL_CHECKPOINT_INTE
 
 SUMMARIZE_DRY_RUN: bool = False
 
+# ---- Scent easter egg (嗅觉彩蛋, Sol-designed ambient feature) ----
+# On extmcp_random_memories we occasionally let the local gemma "smell" the
+# sampled memories into a tiny scent phrase. Scents accumulate in scent_log,
+# distil into summaries every 7, and sometimes drift into breath. The failure
+# mode is deliberately soft — "smelled nothing today": silent, no retry chains.
+SCENT_ENABLED: bool = os.environ.get("SCENT_ENABLED", "1") != "0"
+SCENT_PROBABILITY: float = float(os.environ.get("SCENT_PROBABILITY", "0.35"))
+SCENT_BREATH_PROBABILITY: float = float(os.environ.get("SCENT_BREATH_PROBABILITY", "0.25"))
+SCENT_OLLAMA_TIMEOUT: float = float(os.environ.get("SCENT_OLLAMA_TIMEOUT", "10"))
+
 
 def _load_dotenv(root: Path) -> None:
     """Minimal .env loader shared with maintenance scripts. Populates os.environ
@@ -261,8 +271,12 @@ def _start_maintenance_daemon(store: "MemoryStore", db_path: Path) -> None:
     threading.Thread(target=_loop, daemon=True, name="maint-daemon").start()
 
 
-def _call_ollama(prompt: str) -> str:
-    """Call the local Ollama OpenAI-compatible chat completion endpoint."""
+def _call_ollama(prompt: str, *, timeout: Optional[float] = None) -> str:
+    """Call the local Ollama OpenAI-compatible chat completion endpoint.
+
+    `timeout` overrides the global OLLAMA_TIMEOUT for callers that want a short
+    leash (e.g. the scent easter egg wants ~10s, not the 180s summariser budget).
+    """
     url = f"{OLLAMA_BASE_URL.rstrip('/')}/v1/chat/completions"
     payload = {
         "model": OLLAMA_MODEL,
@@ -277,7 +291,9 @@ def _call_ollama(prompt: str) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+    with urllib.request.urlopen(
+        req, timeout=OLLAMA_TIMEOUT if timeout is None else timeout
+    ) as resp:
         body = resp.read().decode("utf-8", errors="replace")
     parsed = json.loads(body)
     return parsed["choices"][0]["message"]["content"]
@@ -546,7 +562,216 @@ def _compose_breath_output(
                 )
             store.conn.commit()
 
+    # ---- Scent easter egg: occasionally drift an ambient scent line into the
+    #      breath. This line is pure atmosphere and MUST NOT enter `referenced`
+    #      (breath ids <-> memory rows are strictly 1:1). All three breath paths
+    #      (tool / REST hook / CLI) only consume `text`, so an extra plain line
+    #      is safe downstream (confirmed: nobody parses the format).
+    if SCENT_ENABLED and random.random() < SCENT_BREATH_PROBABILITY:
+        scent_line = _scent_pick_for_breath(store)
+        if scent_line:
+            text = f"{text}\n\n{scent_line}" if text else scent_line
+
     return text, referenced
+
+
+# ---------------------------------------------------------------------------
+# Scent easter egg (嗅觉彩蛋) — helpers
+# ---------------------------------------------------------------------------
+
+# Three template families; the code owns the shells, gemma only fills {xx}.
+_SCENT_TMPL_SEABED = (
+    "这些回忆闻起来像是{xx}被从蒙尘的苔藓里拿出",
+    "本次回忆除了湿润的灰尘气息，还闻到了{xx}的味道",
+)
+_SCENT_TMPL_FRESH = (
+    "闻到了那种还带着温度的{xx}气息",
+    "似乎埋进了附近熟悉的{xx}气味场里",
+)
+_SCENT_TMPL_MIDDLE = (
+    "本次回忆时似乎闻到了{xx}一样的味道",
+    "本次回忆让周围的气息里弥漫着{xx}的味道",
+)
+
+_SCENT_XX_PROMPT = (
+    "你是一只嗅觉极其灵敏的鼻子。下面是一组刚被翻出来的回忆碎片。\n"
+    "请为这一整组回忆闻出一种「气味」，只用一个极短的中文短语来概括它。\n"
+    "严格要求：\n"
+    "- 形态只能是「副词+名词」或「单个裸名词」\n"
+    "- 总长度不超过 7 个汉字\n"
+    "- 绝对不要带任何标点、空格、引号或解释\n"
+    "好例子：微凉的铁锈、晒过的棉布、雾\n"
+    "现在只输出这个短语本身，不要多说一个字：\n\n"
+    "回忆碎片：\n"
+)
+
+_SCENT_SUMMARY_PROMPT = (
+    "下面是最近陆续闻到的一串气味描述。\n"
+    "请把它们共同的气味凝练成一个短语，概括这段时间记忆里弥散的味道。\n"
+    "严格要求：\n"
+    "- 总长度不超过 12 个汉字\n"
+    "- 绝对不要带任何标点、空格、引号或解释\n"
+    "现在只输出这个短语本身，不要多说一个字：\n\n"
+    "气味列表：\n"
+)
+
+
+def _scent_validate(raw: str, maxlen: int) -> Optional[str]:
+    """Enforce the metre: strip quotes/whitespace, length <= maxlen, no
+    punctuation and no spaces. Returns the cleaned phrase or None if it fails."""
+    import unicodedata
+
+    if not raw:
+        return None
+    s = raw.strip()
+    quote_chars = "\"'`“”‘’「」『』（）()《》〈〉【】[]"
+    prev = None
+    while s and s != prev:
+        prev = s
+        s = s.strip().strip(quote_chars).strip()
+    if not s or len(s) > maxlen:
+        return None
+    for ch in s:
+        if ch.isspace() or unicodedata.category(ch).startswith("P"):
+            return None
+    return s
+
+
+def _scent_fragments(records: list, per: int = 60, cap: int = 8) -> str:
+    """Compact key + truncated-content lines to feed the nose."""
+    parts = []
+    for rec in records[:cap]:
+        flat = " ".join((rec.content or "").split())
+        parts.append(f"- {rec.key}: {flat[:per]}")
+    return "\n".join(parts)
+
+
+def _scent_smell_xx(fragment_text: str) -> Optional[str]:
+    """Ask gemma for the {xx} phrase. One retry on a metre failure; any Ollama
+    error / timeout gives up immediately and silently (no retry chain)."""
+    prompt = _SCENT_XX_PROMPT + fragment_text
+    for _ in range(2):  # initial try + one retry, but only on metre failure
+        try:
+            raw = _call_ollama(prompt, timeout=SCENT_OLLAMA_TIMEOUT)
+        except Exception as exc:  # timeout / connection / parse — silent give-up
+            sys.stderr.write(f"[scent] smell skipped: {type(exc).__name__}\n")
+            return None
+        xx = _scent_validate(raw, 7)
+        if xx is not None:
+            return xx
+    return None
+
+
+def _scent_pick_template(records: list) -> str:
+    """Choose a template family from the sample's tier makeup."""
+    total = len(records)
+    seabed = sum(1 for r in records if (r.tier or "") == "seabed")
+    fresh = sum(1 for r in records if (r.tier or "") != "seabed")
+    if seabed > total * 2 / 3:
+        family = _SCENT_TMPL_SEABED
+    elif fresh > total / 2:
+        family = _SCENT_TMPL_FRESH
+    else:
+        family = _SCENT_TMPL_MIDDLE
+    return random.choice(family)
+
+
+def _scent_distil(store: "MemoryStore") -> None:
+    """Distil all un-cleared scents into one summary. Silent on any failure —
+    the next filled batch retries. On the 4th batch (28 scents) the scent rows
+    are wiped and the cycle restarts; summaries are globally capped at 4."""
+    with store._lock:
+        rows = store.conn.execute(
+            "SELECT text FROM scent_log WHERE kind='scent' ORDER BY id"
+        ).fetchall()
+    scents = [r["text"] for r in rows]
+    if not scents:
+        return
+
+    prompt = _SCENT_SUMMARY_PROMPT + "\n".join(f"- {s}" for s in scents)
+    core = None
+    for _ in range(2):  # initial try + one retry on metre failure
+        try:
+            raw = _call_ollama(prompt, timeout=SCENT_OLLAMA_TIMEOUT)
+        except Exception as exc:
+            sys.stderr.write(f"[scent] distil skipped: {type(exc).__name__}\n")
+            return  # silent; next filled batch retries
+        core = _scent_validate(raw, 12)
+        if core is not None:
+            break
+    if core is None:
+        return  # metre failed twice — skip, retry next batch
+
+    summary_text = f"最近的回忆弥散着{core}的味觉"
+    now = datetime.now(timezone.utc).isoformat()
+    with store._lock:
+        store.conn.execute(
+            "INSERT INTO scent_log(kind, text, created_at) VALUES ('summary', ?, ?)",
+            (summary_text, now),
+        )
+        # 4th batch of the cycle (>=28 accumulated scents) → wipe scents, restart.
+        if len(scents) >= 28:
+            store.conn.execute("DELETE FROM scent_log WHERE kind='scent'")
+        # Global cap: keep only the newest 4 summaries.
+        store.conn.execute(
+            "DELETE FROM scent_log WHERE kind='summary' AND id NOT IN "
+            "(SELECT id FROM scent_log WHERE kind='summary' ORDER BY id DESC LIMIT 4)"
+        )
+        store.conn.commit()
+
+
+def _scent_persist(store: "MemoryStore", sentence: str) -> None:
+    """Log one finished scent sentence; distil every 7th accumulated scent."""
+    now = datetime.now(timezone.utc).isoformat()
+    with store._lock:
+        store.conn.execute(
+            "INSERT INTO scent_log(kind, text, created_at) VALUES ('scent', ?, ?)",
+            (sentence, now),
+        )
+        store.conn.commit()
+        scent_count = store.conn.execute(
+            "SELECT COUNT(*) FROM scent_log WHERE kind='scent'"
+        ).fetchone()[0]
+    # 凑满 7/14/21/28 条 — distil the whole un-cleared batch.
+    if scent_count and scent_count % 7 == 0:
+        _scent_distil(store)
+
+
+def _maybe_generate_scent(store: "MemoryStore", records: list) -> Optional[str]:
+    """Lazy-smell entry point for extmcp_random_memories. Rolls the dice first
+    (no roll → zero overhead), then smells + persists. Any failure is silent and
+    returns None ("smelled nothing today"). Never raises to the caller."""
+    if not SCENT_ENABLED or not records:
+        return None
+    if random.random() >= SCENT_PROBABILITY:
+        return None
+    try:
+        template = _scent_pick_template(records)
+        xx = _scent_smell_xx(_scent_fragments(records))
+        if xx is None:
+            return None
+        sentence = template.format(xx=xx)
+        _scent_persist(store, sentence)
+        return sentence
+    except Exception as exc:  # DB / anything unexpected — stay soft
+        sys.stderr.write(f"[scent] generate skipped: {type(exc).__name__}\n")
+        return None
+
+
+def _scent_pick_for_breath(store: "MemoryStore") -> Optional[str]:
+    """Newest summary, else newest scent, else nothing. Never raises."""
+    try:
+        with store._lock:
+            row = store.conn.execute(
+                "SELECT text FROM scent_log WHERE kind='summary' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                row = store.conn.execute(
+                    "SELECT text FROM scent_log WHERE kind='scent' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+        return row["text"] if row else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +984,16 @@ class MemoryStore:
                     timestamp TEXT NOT NULL,
                     event TEXT NOT NULL,
                     detail TEXT
+                )
+            """)
+            # Scent easter egg log (嗅觉彩蛋): kind='scent' rows hold finished
+            # scent sentences; kind='summary' rows hold distilled summaries.
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS scent_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT,
+                    text TEXT,
+                    created_at TEXT
                 )
             """)
             # Indexes for the layered-memory architecture: tier-segment queries
@@ -2696,9 +2931,14 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
              "tier": r.tier, "updated_at": r.updated_at}
             for r in results
         ]
+        payload = {"requested": count, "count": len(items), "items": items}
+        # Scent easter egg: lazily rolls the dice inside; adds "scent" only on a
+        # successful smell. Missing field == backward-compatible normal output.
+        scent = _maybe_generate_scent(store, results)
+        if scent:
+            payload["scent"] = scent
         return [{"type": "text", "text": json.dumps(
-            {"requested": count, "count": len(items), "items": items},
-            ensure_ascii=False,
+            payload, ensure_ascii=False,
         )}]
 
     elif name == "extmcp_dream":
