@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -99,6 +100,18 @@ def statistical(apply: bool) -> None:
 def llm(model: str | None, limit: int, allow_raise: bool) -> None:
     sys.path.insert(0, str(HERE))
     import memory_mcp as m
+
+    # Importing memory_mcp does NOT auto-load .env (it only loads in its own
+    # main()), so refresh the ollama settings from .env here before we call the
+    # model. Priority: CLI --model > process env > .env > code default.
+    try:
+        from consolidate_sessions import _load_dotenv
+        _load_dotenv(HERE)
+    except Exception as exc:
+        print(f"[rescore] .env load skipped: {exc}")
+    m.OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", m.OLLAMA_BASE_URL)
+    m.OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", m.OLLAMA_MODEL)
+    m.OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", str(m.OLLAMA_TIMEOUT)))
     if model:
         m.OLLAMA_MODEL = model
     print(f"LLM rescoring with model={m.OLLAMA_MODEL} (limit {limit} rows this run)")

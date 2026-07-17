@@ -35,6 +35,8 @@ start_http.bat
 python memory_mcp.py --http --port 3456 --db ./memory.db
 ```
 
+> **First run**: `start_http.bat` runs `first_run_setup.py` before the server. If no `.env` exists it walks you through a tiny interactive setup (Ollama URL + an optional OpenAI-compatible cloud-parse key) and writes a commented `.env`; on every later launch it's a silent no-op. The wizard also drops a one-shot `.first_run_open` marker so the import page opens in your browser exactly once — subsequent restarts don't pop a tab (pass `--open-browser` to force it, e.g. for debugging).
+
 > **Security note**: the HTTP server has no authentication. Keep it on localhost / a private overlay network (Tailscale etc.); do not expose port 3456 to the public internet.
 
 > **WSL / Windows warning**: never let processes on both sides of the WSL boundary open the SQLite file directly — WAL shared memory does not survive the 9P filesystem, whichever side opens the DB first locks the other out with `disk I/O error`. Run this server on the side that owns the file and let everything else talk to the HTTP port.
@@ -172,6 +174,10 @@ The `/breath-hook` endpoint itself is **read-only** and never activates memories
 | `OLLAMA_MODEL` | summarization / extraction model | `gemma4:e4b` |
 | `OLLAMA_EMBED_MODEL` | embedding model | `qwen3-embedding:4b` |
 | `OLLAMA_TIMEOUT` | request timeout (s) | `180` |
+| `LLM_BACKEND` | cloud-parse backend (`openrouter` = any OpenAI-compatible endpoint; `ollama` = local fallback) | `openrouter` |
+| `OPENROUTER_BASE_URL` | cloud-parse base URL (OpenAI `chat/completions`) | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_API_KEY` | cloud-parse API key (empty → falls back to local ollama) | *(empty)* |
+| `OPENROUTER_MODEL` | cloud-parse model | `google/gemini-3.1-flash-lite-preview` |
 | `DECAY_LAMBDA` | decay coefficient | `0.05` |
 | `DECAY_THRESHOLD` | decay threshold | `0.3` |
 | `BREATH_TOKEN_BUDGET` | breath output length budget | `3000` |
@@ -370,6 +376,10 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 | `OLLAMA_MODEL` | 摘要 / 提取用模型 | `gemma4:e4b` |
 | `OLLAMA_EMBED_MODEL` | embedding 模型 | `qwen3-embedding:4b` |
 | `OLLAMA_TIMEOUT` | 请求超时（秒） | `180` |
+| `LLM_BACKEND` | 云端解析通道（`openrouter` = 任意 OpenAI 兼容端点；`ollama` = 本地兜底） | `openrouter` |
+| `OPENROUTER_BASE_URL` | 云端解析 base URL（OpenAI `chat/completions`） | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_API_KEY` | 云端解析 API key（留空则回退本地 ollama） | *(空)* |
+| `OPENROUTER_MODEL` | 云端解析模型 | `google/gemini-3.1-flash-lite-preview` |
 | `DECAY_LAMBDA` | 衰减系数 | `0.05` |
 | `DECAY_THRESHOLD` | 衰减阈值 | `0.3` |
 | `BREATH_TOKEN_BUDGET` | breath 输出字数预算 | `3000` |

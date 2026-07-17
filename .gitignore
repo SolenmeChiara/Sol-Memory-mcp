@@ -10,6 +10,7 @@ peeks/
 rescore_progress.json
 *.sqlite
 .env
+.first_run_open
 .claude/settings.local.json
 .claude/worktrees/
 
@@ -28,3 +29,5 @@ embeddings.db
 dehydration_cache.db
 venv/
 .venv/
+
+reextract_*.json

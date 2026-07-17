@@ -8,6 +8,9 @@ for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":3456.*LISTENING"') d
 )
 echo.
 
+REM First-run setup: generates .env interactively if missing; silent no-op otherwise.
+python first_run_setup.py
+
 echo Starting Memory MCP HTTP server on port 3456...
 python memory_mcp.py --http --port 3456 --db ./memory.db
 pause

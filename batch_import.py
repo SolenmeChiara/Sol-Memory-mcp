@@ -3,7 +3,7 @@
 
 Usage:
     python batch_import.py "path/to/export.json" [--db memory.db] [--start 0] [--limit 10] [--dry-run]
-    python batch_import.py export.zip --provider gemini --model gemini-2.0-flash-lite
+    python batch_import.py export.zip --provider gemini --model gemini-3.1-flash-lite-preview
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 OLLAMA_BASE_URL: str = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
-OLLAMA_EMBED_MODEL: str = os.environ.get("OLLAMA_EMBED_MODEL", "bge-m3")
+OLLAMA_EMBED_MODEL: str = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:4b")
 OLLAMA_TIMEOUT: float = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
 N_EMBED_WORKERS = 2
 
@@ -40,7 +40,7 @@ N_EMBED_WORKERS = 2
 # Gemini configuration
 # ---------------------------------------------------------------------------
 
-GEMINI_DEFAULT_MODEL = "gemini-flash-lite-latest"
+GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
 GEMINI_TIMEOUT: float = float(os.environ.get("GEMINI_TIMEOUT", "180"))
 # 8192 leaves enough headroom for thinking models (gemini-3.5-flash, gemini-3-*)
 # to reason AND still emit a multi-memory JSON array. Non-thinking lite models
@@ -603,6 +603,25 @@ def main() -> None:
             except Exception:
                 pass
 
+    # Load .env (same loader consolidate uses) BEFORE anything reads the model
+    # constants, then refresh the module globals — the OLLAMA_* constants at the
+    # top of this file were evaluated at import time, so without this refresh a
+    # standalone `python batch_import.py` run would ignore .env entirely and fall
+    # back to the code defaults (e.g. embedding model). Priority stays
+    # process-env > .env > code default because _load_dotenv uses setdefault and
+    # os.environ.get() below reads the already-populated environment.
+    global OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_EMBED_MODEL, OLLAMA_TIMEOUT, GEMINI_TIMEOUT
+    try:
+        from consolidate_sessions import _load_dotenv
+        _load_dotenv(SCRIPT_DIR)
+    except Exception as exc:  # never let a .env hiccup block the import
+        sys.stderr.write(f"[batch_import] .env load skipped: {exc}\n")
+    OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
+    OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", OLLAMA_MODEL)
+    OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_EMBED_MODEL)
+    OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", str(OLLAMA_TIMEOUT)))
+    GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", str(GEMINI_TIMEOUT)))
+
     parser = argparse.ArgumentParser(
         description="Batch import conversation exports into the memory SQLite database"
     )
@@ -626,7 +645,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model", default=None,
-        help="Model name. Default: gemma4:e4b (ollama) or gemini-2.0-flash-lite (gemini)",
+        help="Model name. Default: gemma4:e4b (ollama) or gemini-3.1-flash-lite-preview (gemini)",
     )
     parser.add_argument(
         "--session-mode", action=argparse.BooleanOptionalAction, default=True,

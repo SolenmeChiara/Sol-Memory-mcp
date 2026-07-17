@@ -316,6 +316,39 @@ def _call_ollama_embedding(text: str) -> list:
         return []
 
 
+# ---- Ollama reachability probe (cached) --------------------------------------
+# The import UI polls /stats every 5s; a real ollama round-trip on every poll
+# would hammer the local server. Cache the reachability result for a short TTL
+# so the status endpoint stays cheap.
+_OLLAMA_REACH: Dict[str, float] = {"ts": 0.0, "ok": 0.0}
+_OLLAMA_REACH_TTL = 30.0
+_OLLAMA_REACH_LOCK = threading.Lock()
+
+
+def _ollama_reachable() -> bool:
+    """True if the ollama server answers /api/tags within a short timeout.
+
+    Result is cached for _OLLAMA_REACH_TTL seconds (thread-safe) so the /stats
+    poller doesn't probe ollama on every request."""
+    now = _time_mod.monotonic()
+    with _OLLAMA_REACH_LOCK:
+        if now - _OLLAMA_REACH["ts"] < _OLLAMA_REACH_TTL and _OLLAMA_REACH["ts"] > 0:
+            return bool(_OLLAMA_REACH["ok"])
+    ok = False
+    try:
+        req = urllib.request.Request(
+            f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags", method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            ok = 200 <= resp.status < 300
+    except Exception:
+        ok = False
+    with _OLLAMA_REACH_LOCK:
+        _OLLAMA_REACH["ts"] = now
+        _OLLAMA_REACH["ok"] = 1.0 if ok else 0.0
+    return ok
+
+
 _EMOTION_PROMPT = (
     "分析以下文本，输出情感坐标。\n"
     "valence（情感效价）：0.0~1.0，0=极度消极 0.5=中性 1.0=极度积极\n"
@@ -1929,9 +1962,14 @@ async function refreshStats(){
     btnPrune.textContent=s.digested_stale>0
       ? `清理过期归档 (${s.digested_stale})`
       : '清理过期归档';
-    if(!s.openrouter_key_present){
+    if(!s.analysis_ready){
+      // 没有任何解析通道：云端 key 不在，本地 ollama 也不可达
       btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
-      consolidateHint.textContent='未检测到 OPENROUTER_API_KEY（.env 未配置或需重启 server）';
+      consolidateHint.textContent='未配置云端解析通道（.env 里配 OPENROUTER_API_KEY，或启动本地 Ollama）';
+    }else if(!s.openrouter_key_present){
+      // 本地解析可用，但网页端合并走的是云端通道，仍需 key
+      btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
+      consolidateHint.textContent='网页合并走云端通道，需在 .env 配 OPENROUTER_API_KEY（本地解析可用 batch_import 离线跑）';
     }else if(s.unconsolidated_sessions_over_5===0){
       btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
       consolidateHint.textContent='没有待合并的 session';
@@ -3268,7 +3306,7 @@ def _run_stdio(store: MemoryStore) -> None:
 # HTTP transport (Streamable HTTP for MCP + legacy JSON-RPC)
 # ---------------------------------------------------------------------------
 
-def _run_http(store: MemoryStore, host: str, port: int) -> None:
+def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = False) -> None:
     import time as _time
     from http.server import HTTPServer, BaseHTTPRequestHandler
     from socketserver import ThreadingMixIn
@@ -3914,6 +3952,11 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                     for t in _IMPORT_TASKS.values() if not t.get("done")
                 ]
 
+            # Readiness signals for the import UI. embedding needs a reachable
+            # ollama; cloud analysis (consolidate/extract) needs *either* a cloud
+            # key or a reachable local ollama fallback.
+            openrouter_present = bool(os.environ.get("OPENROUTER_API_KEY"))
+            ollama_ok = _ollama_reachable()
             self._send_json(200, {
                 "long_term_count": long_term,
                 "with_embedding": with_emb,
@@ -3925,7 +3968,9 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
                 "digested_stale": digested_stale,
                 "prune_days": DIGESTED_PRUNE_DAYS,
                 "active_tasks": active,
-                "openrouter_key_present": bool(os.environ.get("OPENROUTER_API_KEY")),
+                "openrouter_key_present": openrouter_present,
+                "analysis_ready": openrouter_present or ollama_ok,
+                "embedding_ready": ollama_ok,
             })
 
         def _handle_admin_reindex(self) -> None:
@@ -4219,7 +4264,26 @@ def _run_http(store: MemoryStore, host: str, port: int) -> None:
     sys.stderr.write(f"[memory-mcp]   Legacy JSON-RPC:        POST http://{host}:{port}/\n")
     sys.stderr.write(f"[memory-mcp]   Breath hook:            GET  http://{host}:{port}/breath-hook\n")
     sys.stderr.write(f"[memory-mcp]   Import UI:              GET  http://localhost:{port}/import\n")
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{port}/import")).start()
+
+    # Only auto-open the import page on a genuine first run (the setup wizard
+    # dropped a one-shot `.first_run_open` marker next to this script) or when
+    # the operator explicitly asks with --open-browser. Every other restart of
+    # the 3456 service stays silent — no more surprise tab on every launch.
+    _marker = Path(__file__).resolve().parent / ".first_run_open"
+    _first_run = _marker.exists()
+    if open_browser or _first_run:
+        def _open_import_once() -> None:
+            try:
+                webbrowser.open(f"http://localhost:{port}/import")
+            except Exception:
+                pass
+            finally:
+                if _first_run:
+                    try:
+                        _marker.unlink()
+                    except OSError:
+                        pass
+        threading.Timer(1.0, _open_import_once).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4276,6 +4340,11 @@ def main() -> None:
         "--dry-run", action="store_true", default=False,
         help="Summarize tool returns fake data instantly (for debugging)",
     )
+    parser.add_argument(
+        "--open-browser", action="store_true", default=False,
+        help="Open the import page in a browser on startup (HTTP mode). "
+             "Off by default; the first-run wizard triggers it once via a marker file.",
+    )
     args = parser.parse_args()
 
     OLLAMA_BASE_URL = args.ollama_url
@@ -4289,6 +4358,16 @@ def main() -> None:
     _load_dotenv(db_path.parent)
     _load_dotenv(Path(__file__).parent)
 
+    # CLI flags win; otherwise let the .env just loaded refresh the module
+    # globals — they were frozen at import time, before .env existed in the
+    # environment, so without this the HTTP server never sees .env overrides.
+    if args.ollama_url == parser.get_default("ollama_url"):
+        OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
+    if args.ollama_model == parser.get_default("ollama_model"):
+        OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", OLLAMA_MODEL)
+    if args.ollama_timeout == parser.get_default("ollama_timeout"):
+        OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", OLLAMA_TIMEOUT))
+
     store = MemoryStore(db_path)
 
     # One eager prune at startup so users see immediate effect after raising
@@ -4301,7 +4380,7 @@ def main() -> None:
     _start_maintenance_daemon(store, db_path)
 
     if args.http:
-        _run_http(store, args.host, args.port)
+        _run_http(store, args.host, args.port, open_browser=args.open_browser)
     else:
         _run_stdio(store)
 

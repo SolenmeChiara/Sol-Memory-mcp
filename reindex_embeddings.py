@@ -281,6 +281,23 @@ def main() -> None:
             except Exception:
                 pass
 
+    # Load .env before touching the OLLAMA_* module constants — they were
+    # evaluated at import time, so a standalone run would otherwise never see
+    # .env overrides (base URL, embedding model). Priority stays
+    # process-env > .env > code default (_load_dotenv uses setdefault; the
+    # os.environ.get() calls below read the already-populated environment).
+    # The web path (memory_mcp importing run_reindex) already has .env loaded
+    # into os.environ before this module is imported, so it's unaffected.
+    global OLLAMA_BASE_URL, OLLAMA_EMBED_MODEL, OLLAMA_TIMEOUT
+    try:
+        from consolidate_sessions import _load_dotenv
+        _load_dotenv(Path(__file__).resolve().parent)
+    except Exception as exc:
+        sys.stderr.write(f"[reindex] .env load skipped: {exc}\n")
+    OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
+    OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_EMBED_MODEL)
+    OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", str(OLLAMA_TIMEOUT)))
+
     parser = argparse.ArgumentParser(
         description="Backfill / re-align embeddings for memories in the SQLite store"
     )
