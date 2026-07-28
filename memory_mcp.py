@@ -627,6 +627,257 @@ def _compose_breath_output(
 
 
 # ---------------------------------------------------------------------------
+# Associative surfacing (联想浮现) — passive RAG behind the CC hook
+# ---------------------------------------------------------------------------
+#
+# GET /associate feeds a UserPromptSubmit hook that silently appends a stray
+# memory line to the conversation context. Design constraints that differ from
+# breath:
+#   * archive / seabed are NOT excluded — old stock is exactly the point.
+#   * pinned IS excluded (breath already surfaces those every cycle).
+#   * anything created inside the last 48h is excluded (the injector's own
+#     "recent memories" segment already carries it).
+#   * no activation touch: an association is a bystander, it must not reshape
+#     the weights it happened to walk past (same reasoning as /breath-hook's
+#     do_touch=False).
+#
+# The master switch lives here rather than in the hook so that a single source
+# of truth (app_config in memory.db) decides, and either Claude — backstage or
+# front — can dial it through extmcp_associate_config. Default is off.
+
+ASSOCIATE_RECENT_HOURS: float = float(os.environ.get("ASSOCIATE_RECENT_HOURS", "48"))
+ASSOCIATE_COOLDOWN_HOURS: float = float(os.environ.get("ASSOCIATE_COOLDOWN_HOURS", "24"))
+ASSOCIATE_MAX_CHARS: int = int(os.environ.get("ASSOCIATE_MAX_CHARS", "400"))
+
+ASSOCIATE_CFG_ENABLED = "associate.enabled"
+ASSOCIATE_CFG_MAX_ITEMS = "associate.max_items"
+ASSOCIATE_DEFAULT_ENABLED = False
+ASSOCIATE_DEFAULT_MAX_ITEMS = 3
+ASSOCIATE_MAX_ITEMS_MIN = 1
+ASSOCIATE_MAX_ITEMS_MAX = 6
+
+
+# Where the hook script lives. The server normally runs on the Windows side,
+# so the D:/ spelling comes first; the /mnt/d spelling keeps the check honest
+# when the same code runs under WSL. ASSOCIATE_HOOK_PATH overrides both (test
+# seam). A missing path simply means "not wired" — never an error.
+ASSOCIATE_HOOK_PATHS = (
+    "D:/ClaudeExtentions/MCP/nudge-agent/associate_hook.py",
+    "/mnt/d/ClaudeExtentions/MCP/nudge-agent/associate_hook.py",
+)
+
+# Tools that only make sense when the hook pipeline can actually reach the
+# client. Hiding is cosmetic, not a permission: a client that calls one anyway
+# still gets served (see _dispatch). The point is to keep kelivo and other
+# plain-HTTP front ends from being offered a switch they cannot use.
+HOOK_ONLY_TOOLS = frozenset({"extmcp_associate_config"})
+
+
+def _associate_hook_wired() -> bool:
+    override = os.environ.get("ASSOCIATE_HOOK_PATH")
+    candidates = (override,) if override else ASSOCIATE_HOOK_PATHS
+    for path in candidates:
+        try:
+            if path and os.path.exists(path):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _client_name_from_params(params: Any) -> str:
+    """Pull clientInfo.name out of an initialize request; '' when absent."""
+    if not isinstance(params, dict):
+        return ""
+    info = params.get("clientInfo")
+    if not isinstance(info, dict):
+        return ""
+    name = info.get("name")
+    return name if isinstance(name, str) else ""
+
+
+def _is_claude_code_client(client_name: str) -> bool:
+    """Loose match on the handshake name: claude-code / claude_code / Claude Code.
+    An unknown or missing name is NOT Claude Code — hiding is the safe side."""
+    norm = "".join(ch for ch in (client_name or "").lower() if ch.isalnum())
+    return "claudecode" in norm
+
+
+def _visible_tools(client_name: str) -> List[Dict[str, Any]]:
+    """TOOLS as advertised to this particular client."""
+    if _is_claude_code_client(client_name) and _associate_hook_wired():
+        return TOOLS
+    return [t for t in TOOLS if t.get("name") not in HOOK_ONLY_TOOLS]
+
+
+def _associate_clamp_max_items(value: Any) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return ASSOCIATE_DEFAULT_MAX_ITEMS
+    return max(ASSOCIATE_MAX_ITEMS_MIN, min(ASSOCIATE_MAX_ITEMS_MAX, n))
+
+
+def _associate_get_config(store: "MemoryStore") -> Dict[str, Any]:
+    """Read the switch. Any unreadable/garbled value falls back to the default,
+    which for `enabled` means off — the safe direction."""
+    try:
+        raw_enabled = store.get_config(ASSOCIATE_CFG_ENABLED)
+        raw_max = store.get_config(ASSOCIATE_CFG_MAX_ITEMS)
+    except Exception:
+        raw_enabled, raw_max = None, None
+    if raw_enabled is None:
+        enabled = ASSOCIATE_DEFAULT_ENABLED
+    else:
+        enabled = str(raw_enabled).strip().lower() in ("1", "true", "yes", "on")
+    max_items = (
+        ASSOCIATE_DEFAULT_MAX_ITEMS if raw_max is None
+        else _associate_clamp_max_items(raw_max)
+    )
+    return {"enabled": enabled, "max_items": max_items}
+
+
+def _associate_set_config(
+    store: "MemoryStore",
+    *,
+    enabled: Optional[bool] = None,
+    max_items: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Update whichever fields were given; return the resulting state."""
+    if enabled is not None:
+        store.set_config(ASSOCIATE_CFG_ENABLED, "true" if enabled else "false")
+    if max_items is not None:
+        store.set_config(
+            ASSOCIATE_CFG_MAX_ITEMS, str(_associate_clamp_max_items(max_items))
+        )
+    return _associate_get_config(store)
+
+# memory id -> monotonic-ish wall clock of the last time it was surfaced.
+# Process-local on purpose: a server restart clearing it costs at most one
+# repeated line, and keeping it out of the db keeps this path write-free.
+_associate_cooldown: Dict[str, float] = {}
+_associate_cooldown_lock = threading.Lock()
+
+
+def _associate_flatten(text: str, max_chars: int = ASSOCIATE_MAX_CHARS) -> str:
+    """Collapse all whitespace onto one line and clip to max_chars."""
+    flat = " ".join((text or "").split())
+    if len(flat) > max_chars:
+        flat = flat[: max(1, max_chars - 1)] + "…"
+    return flat
+
+
+def _associate_parse_ts(value: str) -> Optional[datetime]:
+    """Best-effort ISO parse; returns an aware UTC datetime or None."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _associate_effective_ceiling(
+    requested: Optional[Any], max_items: int
+) -> int:
+    """Reconcile a caller's per-request wish with the server-side ceiling.
+
+    Two layers, deliberately: `max_items` is standing policy, `requested` is
+    this one call's appetite. Neither can raise the other — the smaller wins.
+    A missing, unparseable or non-positive request means "no opinion", which
+    falls back to policy rather than to zero.
+    """
+    if requested is None:
+        return max(ASSOCIATE_MAX_ITEMS_MIN,
+                   min(ASSOCIATE_MAX_ITEMS_MAX, max_items))
+    try:
+        wish = int(requested)
+    except (TypeError, ValueError):
+        wish = 0
+    if wish < ASSOCIATE_MAX_ITEMS_MIN:
+        wish = max_items
+    return max(ASSOCIATE_MAX_ITEMS_MIN,
+               min(ASSOCIATE_MAX_ITEMS_MAX, min(wish, max_items)))
+
+
+def _compose_associate_output(
+    store: "MemoryStore",
+    *,
+    query: str,
+    limit: Optional[Any] = None,
+) -> str:
+    """Return the association lines for `query` (empty string = nothing).
+
+    Reuses MemoryStore.search (BM25 + vector + MMR) verbatim, then applies the
+    association-specific filters and the cooldown ledger. How many lines come
+    back is itself a roll: 1..ceiling, so the texture stays uneven the way a
+    stray thought is. Fewer survivors than the roll asked for is fine, zero
+    included — a quiet turn is a normal result, not a failure.
+
+    `limit` is the caller's ceiling for this one request; omitted, the server's
+    max_items stands in. See _associate_effective_ceiling.
+    """
+    query = (query or "").strip()
+    if not query:
+        return ""
+
+    cfg = _associate_get_config(store)
+    if not cfg["enabled"]:
+        return ""
+    ceiling = _associate_effective_ceiling(limit, cfg["max_items"])
+    limit = random.randint(1, ceiling)
+
+    try:
+        query_embedding = _call_ollama_embedding(query) or None
+    except Exception:  # embedding backend down → degrade to keyword-only
+        query_embedding = None
+
+    # Over-fetch: the filters below can eat most of a small result set, and
+    # search() already ran MMR against whatever limit it was given.
+    pool = store.search(
+        query, query_embedding=query_embedding, limit=max(limit * 6, 12)
+    )
+
+    now = datetime.now(timezone.utc)
+    recent_cutoff = now - timedelta(hours=ASSOCIATE_RECENT_HOURS)
+    now_ts = _time_mod.time()
+    cold_cutoff = now_ts - ASSOCIATE_COOLDOWN_HOURS * 3600
+
+    picked: List[MemoryRecord] = []
+    with _associate_cooldown_lock:
+        # Opportunistic prune so the ledger cannot grow without bound.
+        for mid, ts in list(_associate_cooldown.items()):
+            if ts < cold_cutoff:
+                _associate_cooldown.pop(mid, None)
+        for rec in pool:
+            if len(picked) >= limit:
+                break
+            if rec.pinned:
+                continue
+            created = _associate_parse_ts(rec.created_at)
+            if created is not None and created >= recent_cutoff:
+                continue
+            if _associate_cooldown.get(rec.id, 0.0) >= cold_cutoff:
+                continue
+            picked.append(rec)
+        for rec in picked:
+            _associate_cooldown[rec.id] = now_ts
+
+    lines = []
+    for rec in picked:
+        stamp = (rec.created_at or "")[:7] or "?"
+        lines.append(
+            f"[联想|id:{rec.id}|{stamp}] "
+            f"{_associate_flatten(rec.key, 60)}: {_associate_flatten(rec.content)}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Scent easter egg (嗅觉彩蛋) — helpers
 # ---------------------------------------------------------------------------
 
@@ -1047,6 +1298,16 @@ class MemoryStore:
                     created_at TEXT
                 )
             """)
+            # Small persistent key/value store for server-side settings that a
+            # model can dial at runtime (currently the associative-surfacing
+            # switch). Values are stored as TEXT and parsed by the caller.
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS app_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT
+                )
+            """)
             # Indexes for the layered-memory architecture: tier-segment queries
             # (breath), and direct id/key/prefix lookups (extmcp_get_memory /
             # extmcp_set_tier bypass semantic search).
@@ -1293,6 +1554,26 @@ class MemoryStore:
         # Any upsert may add/change an embedding → invalidate cache.
         self._mark_emb_dirty()
         return self._row_to_record(row)
+
+    # ---- app_config (small persistent kv for runtime-dialable settings) ----
+
+    def get_config(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT value FROM app_config WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row is not None else default
+
+    def set_config(self, key: str, value: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO app_config(key, value, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (key, value, now),
+            )
+            self.conn.commit()
 
     def get_memory(self, memory_id: str) -> Optional[MemoryRecord]:
         with self._lock:
@@ -2582,6 +2863,38 @@ TOOLS = [
             "required": ["message"],
         },
     },
+    {
+        "name": "extmcp_associate_config",
+        "description": (
+            "联想浮现（被动 RAG）的总开关与条数上限。联想浮现是一条 hook 管道："
+            "后台每收到一条用户消息，都有小概率拿最近几轮对话当引子去检索记忆库，"
+            "把一两条陈年旧记忆无声地附加进上下文——不经过工具调用，也不显式注入，"
+            "像一个念头自己飘过来。检索会跳过最近 48 小时的记忆和 pinned 条目"
+            "（那些已经在别处曝光），但**不**跳过 archive / seabed：库底的旧货正是它的价值。"
+            "同一条记忆 24 小时内不会重复浮现，浮现也不会改写记忆权重。\n"
+            "无参调用=查询当前状态；带参调用=更新并返回新状态。"
+            "enabled 默认 false（装好也不生效，要谁想要谁自己打开）；"
+            "max_items 默认 3、合法范围 1-6，超界自动钳制——"
+            "每次实际浮现条数是 1 到上限之间的随机数，可能一条都没有。"
+            "调用方（/associate?limit=N）可以就单次请求把上限压得更低，但压不高："
+            "有效上限取两者较小值，max_items 始终是天花板。"
+            "配置存在 memory.db 里，服务重启后仍然有效。前台和后台都可以拨。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "true=开启联想浮现，false=关闭（默认关闭）。省略=不改动",
+                },
+                "max_items": {
+                    "type": "integer",
+                    "description": "单次浮现条数上限，1-6，超界钳制（默认 3）。省略=不改动",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -3262,6 +3575,33 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
              "priority": priority},
             ensure_ascii=False)}]
 
+    elif name == "extmcp_associate_config":
+        # No args → pure read. Anything supplied is clamped, never rejected:
+        # a switch that argues back is a switch nobody flips.
+        enabled_arg = args.get("enabled")
+        max_arg = args.get("max_items")
+        enabled = None if enabled_arg is None else bool(enabled_arg)
+        changed = enabled is not None or max_arg is not None
+        if changed:
+            state = _associate_set_config(
+                store, enabled=enabled, max_items=max_arg)
+        else:
+            state = _associate_get_config(store)
+        note = (
+            "联想浮现已开启：后台每条用户消息有约 15% 概率触发一次检索，"
+            f"命中时随机浮现 1-{state['max_items']} 条旧记忆。"
+            if state["enabled"] else
+            "联想浮现当前关闭：/associate 端点一律空响应，hook 不做任何事。"
+        )
+        return [{"type": "text", "text": json.dumps({
+            "ok": True,
+            "updated": changed,
+            "enabled": state["enabled"],
+            "max_items": state["max_items"],
+            "max_items_range": [ASSOCIATE_MAX_ITEMS_MIN, ASSOCIATE_MAX_ITEMS_MAX],
+            "note": note,
+        }, ensure_ascii=False)}]
+
     else:
         raise ValueError(f"unknown tool: {name}")
 
@@ -3270,8 +3610,17 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
 # JSON-RPC dispatch (shared by stdio and HTTP)
 # ---------------------------------------------------------------------------
 
-def _dispatch(store: MemoryStore, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Process one JSON-RPC message. Returns a response dict, or None for notifications."""
+def _dispatch(
+    store: MemoryStore,
+    msg: Dict[str, Any],
+    client_name: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Process one JSON-RPC message. Returns a response dict, or None for notifications.
+
+    `client_name` is whatever the client called itself at handshake time; it
+    only affects which tools get *advertised* (see _visible_tools). Calls are
+    never gated on it — a client that already knows a tool's name may use it.
+    """
     method = msg.get("method", "")
     request_id = msg.get("id")
     params = msg.get("params", {})
@@ -3287,7 +3636,7 @@ def _dispatch(store: MemoryStore, msg: Dict[str, Any]) -> Optional[Dict[str, Any
         })
 
     elif method == "tools/list":
-        return _response(request_id, {"tools": TOOLS})
+        return _response(request_id, {"tools": _visible_tools(client_name)})
 
     elif method == "tools/call":
         tool_name = params.get("name", "")
@@ -3317,11 +3666,14 @@ def _dispatch(store: MemoryStore, msg: Dict[str, Any]) -> Optional[Dict[str, Any
 # ---------------------------------------------------------------------------
 
 def _run_stdio(store: MemoryStore) -> None:
+    client_name = ""  # one connection per process, so one name is enough
     while True:
         msg = _read_message(sys.stdin.buffer)
         if msg is None:
             break
-        resp = _dispatch(store, msg)
+        if msg.get("method") == "initialize":
+            client_name = _client_name_from_params(msg.get("params"))
+        resp = _dispatch(store, msg, client_name=client_name)
         if resp is not None:
             _write_message(resp)
 
@@ -3336,6 +3688,9 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
     from socketserver import ThreadingMixIn
 
     _sessions: Dict[str, float] = {}
+    # sid -> clientInfo.name from the handshake. Kept beside _sessions rather
+    # than folded into it so the existing float-valued contract stays intact.
+    _session_clients: Dict[str, str] = {}
     _sessions_lock = threading.Lock()
 
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -3366,9 +3721,13 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
             messages = msg if isinstance(msg, list) else [msg]
             has_requests = any(m.get("id") is not None for m in messages)
 
+            sid = self.headers.get("Mcp-Session-Id", "")
+
             if not has_requests:
+                with _sessions_lock:
+                    client_name = _session_clients.get(sid, "")
                 for m in messages:
-                    _dispatch(store, m)
+                    _dispatch(store, m, client_name=client_name)
                 self.send_response(202)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
@@ -3381,8 +3740,12 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                     sid = os.urandom(16).hex()
                     with _sessions_lock:
                         _sessions[sid] = _time.time()
+                        _session_clients[sid] = _client_name_from_params(
+                            m.get("params"))
                     extra_headers["Mcp-Session-Id"] = sid
-                resp = _dispatch(store, m)
+                with _sessions_lock:
+                    client_name = _session_clients.get(sid, "")
+                resp = _dispatch(store, m, client_name=client_name)
                 if resp is not None:
                     responses.append(resp)
 
@@ -3421,6 +3784,7 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
             if sid:
                 with _sessions_lock:
                     _sessions.pop(sid, None)
+                    _session_clients.pop(sid, None)
             self.send_response(200)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -3453,6 +3817,54 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
+
+        def _handle_associate(self) -> None:
+            """GET /associate?q=<text>[&limit=N] — 联想浮现 (passive RAG).
+
+            Read-only and activation-free, same reasoning as /breath-hook: the
+            consumer is an automatic hook, so surfacing must not amplify what it
+            surfaced. Returns text/plain, one line per memory; 204 whenever
+            nothing comes back — switch off, no survivors, or a bad day for the
+            retriever all look identical to the caller, deliberately.
+
+            `limit` is one request's ceiling, not a setting: it can only lower
+            the server's max_items, never raise it, and omitting it simply
+            defers to policy. The enable switch stays the server's alone.
+            """
+            qs = urllib.parse.parse_qs(
+                self.path.split("?", 1)[1] if "?" in self.path else ""
+            )
+            query = (qs.get("q", [""])[0] or "").strip()
+            raw_limit = qs.get("limit", [None])[0]
+
+            if not query:
+                self._send_json(400, {"ok": False, "error": "q is required"})
+                return
+
+            try:
+                text = _compose_associate_output(
+                    store, query=query, limit=raw_limit)
+            except Exception as exc:  # never 500 into a hook
+                sys.stderr.write(f"[associate] failed: {exc!r}\n")
+                sys.stderr.flush()
+                text = ""
+
+            if not text:
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                return
+
+            body = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                pass
 
         # ---- Phone status endpoints ------------------------------------------
 
@@ -3844,6 +4256,8 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
         # ---- Legacy / endpoint (backward compat) -------------------------
 
         def _handle_legacy_post(self) -> None:
+            # No session layer here, so no handshake identity: tools/list over
+            # the legacy endpoint always gets the conservative (hidden) view.
             _t0 = _time.monotonic()
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
@@ -4249,6 +4663,8 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                 self._handle_mcp_get()
             elif path == "/breath-hook":
                 self._handle_breath_hook()
+            elif path == "/associate":
+                self._handle_associate()
             elif path == "/import":
                 self._handle_import_get()
             elif path == "/import/status":
@@ -4272,6 +4688,7 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                         "streamable_http": "/mcp",
                         "legacy_json_rpc": "/",
                         "breath_hook": "/breath-hook",
+                        "associate": "/associate",
                         "import_ui": "/import",
                     },
                 }, ensure_ascii=False).encode("utf-8")
@@ -4303,6 +4720,7 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
     sys.stderr.write(f"[memory-mcp]   Streamable HTTP (MCP): POST http://{host}:{port}/mcp\n")
     sys.stderr.write(f"[memory-mcp]   Legacy JSON-RPC:        POST http://{host}:{port}/\n")
     sys.stderr.write(f"[memory-mcp]   Breath hook:            GET  http://{host}:{port}/breath-hook\n")
+    sys.stderr.write(f"[memory-mcp]   Associate hook:         GET  http://{host}:{port}/associate?q=...\n")
     sys.stderr.write(f"[memory-mcp]   Import UI:              GET  http://localhost:{port}/import\n")
 
     # Only auto-open the import page on a genuine first run (the setup wizard
