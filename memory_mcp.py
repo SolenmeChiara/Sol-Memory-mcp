@@ -1766,10 +1766,17 @@ class MemoryStore:
 
         keyword_hits: list[MemoryRecord] = []
         if keyword_rows:
+            # sqlite's bm25() is negative and *more negative = more relevant*
+            # (that is why the SQL above orders ascending). Taking |bm25| turns
+            # it back into a "bigger = better" magnitude, and dividing by the
+            # strongest hit puts it on the same 0..1 scale as vector_score so
+            # the weighted sum below compares like with like. The LIKE fallback
+            # feeds a constant, which flattens to 1.0 for every fallback row —
+            # they then rank purely by whatever vector score they carry.
             max_s = max(abs(float(r["keyword_score"])) for r in keyword_rows) or 1.0
             for r in keyword_rows:
                 rec = self._row_to_record(r)
-                rec.keyword_score = 1.0 - min(abs(float(r["keyword_score"])) / max_s, 1.0)
+                rec.keyword_score = min(abs(float(r["keyword_score"])) / max_s, 1.0)
                 keyword_hits.append(rec)
         timing["kw_ms"] = (_time_mod.monotonic() - t0) * 1000
 
