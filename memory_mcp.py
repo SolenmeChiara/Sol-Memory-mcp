@@ -299,7 +299,15 @@ def _call_ollama(prompt: str, *, timeout: Optional[float] = None) -> str:
     return parsed["choices"][0]["message"]["content"]
 
 
-def _call_ollama_embedding(text: str) -> list:
+def _call_ollama_embedding(text: str, *, timeout: Optional[float] = None) -> list:
+    """Embed `text` with the local Ollama embedding model; [] on any failure.
+
+    `timeout` overrides the global OLLAMA_TIMEOUT for callers on a short leash
+    (same pattern as _call_ollama above — /associate answers a hook that gives
+    up after 5s, so it must not pin a worker thread for the 180s budget).
+    Failures stay silent either way: a timeout is just another empty embedding,
+    and callers degrade to keyword-only search.
+    """
     url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
     payload = {"model": OLLAMA_EMBED_MODEL, "input": text[:2000]}
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -307,7 +315,9 @@ def _call_ollama_embedding(text: str) -> list:
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
     try:
-        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+        with urllib.request.urlopen(
+            req, timeout=OLLAMA_TIMEOUT if timeout is None else timeout
+        ) as resp:
             body = resp.read().decode("utf-8")
         parsed = json.loads(body)
         embeddings = parsed.get("embeddings", [])
@@ -648,6 +658,12 @@ def _compose_breath_output(
 ASSOCIATE_RECENT_HOURS: float = float(os.environ.get("ASSOCIATE_RECENT_HOURS", "48"))
 ASSOCIATE_COOLDOWN_HOURS: float = float(os.environ.get("ASSOCIATE_COOLDOWN_HOURS", "24"))
 ASSOCIATE_MAX_CHARS: int = int(os.environ.get("ASSOCIATE_MAX_CHARS", "400"))
+# Short leash on the embedding call. The hook hangs up after 5s, so anything
+# longer only leaves a worker thread holding a dead connection; losing the
+# vector half of the search is the cheap, silent fallback.
+ASSOCIATE_EMBED_TIMEOUT: float = float(
+    os.environ.get("ASSOCIATE_EMBED_TIMEOUT", "4")
+)
 
 ASSOCIATE_CFG_ENABLED = "associate.enabled"
 ASSOCIATE_CFG_MAX_ITEMS = "associate.max_items"
@@ -832,7 +848,9 @@ def _compose_associate_output(
     limit = random.randint(1, ceiling)
 
     try:
-        query_embedding = _call_ollama_embedding(query) or None
+        query_embedding = _call_ollama_embedding(
+            query, timeout=ASSOCIATE_EMBED_TIMEOUT
+        ) or None
     except Exception:  # embedding backend down → degrade to keyword-only
         query_embedding = None
 
