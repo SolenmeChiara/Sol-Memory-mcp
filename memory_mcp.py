@@ -433,6 +433,7 @@ def _compose_breath_output(
     do_touch: bool = False,
     touch_weight: float = 0.3,
     cooldown_hours: float = 6.0,
+    budget: int | None = None,
 ) -> tuple[str, list[str]]:
     """Build the 'breath' text — a weighted sample of pinned + top-decay unresolved memories.
 
@@ -441,7 +442,20 @@ def _compose_breath_output(
     do_touch=True applies a discounted activation: only memories not touched by breath
     in the last `cooldown_hours` get +touch_weight to activation_count and a fresh
     last_breath_at timestamp. Avoids the runaway feedback Gemini & gpt5.4 both flagged.
+
+    `budget` is the character budget for the rendered segments:
+      * None (default) — fall back to the module-level BREATH_TOKEN_BUDGET.
+        This keeps the extmcp_breath tool and the CLI subcommand on the historic
+        3000-char cap so claude.ai context cost is unchanged.
+      * 0 or any negative value — UNLIMITED: no segment header and no row is
+        ever dropped. Used by GET /breath-hook, whose consumer (the nudge
+        injector) renders memories incrementally and therefore wants the whole
+        thing; the budget cap there used to swallow entire segments, leaving a
+        header with no rows under it.
+      * any positive value — that many characters, same semantics as before.
     """
+    effective_budget = BREATH_TOKEN_BUDGET if budget is None else budget
+    unlimited = effective_budget <= 0
     # 1) Pinned quota (unchanged — pinned wins regardless of tier)
     with store._lock:
         pinned_rows = store.conn.execute(
@@ -524,10 +538,13 @@ def _compose_breath_output(
 
     # 6) Format with token budget (rough: 1 char ≈ 1 token for CJK; whitespace flattened)
     def _fmt(rec, weight_str: str) -> str:
+        # key flattened too: a newline inside it would split the row and orphan
+        # the continuation from its [id:...] prefix (breaks per-line consumers).
+        flat_key = " ".join((rec.key or "").split())
         flat = " ".join((rec.content or "").split())
         return (
             f"[id:{rec.id}] [weight:{weight_str} "
-            f"V{rec.valence:.1f}/A{rec.arousal:.1f}] {rec.key}: {flat}"
+            f"V{rec.valence:.1f}/A{rec.arousal:.1f}] {flat_key}: {flat}"
         )
 
     lines: list[str] = []
@@ -535,12 +552,13 @@ def _compose_breath_output(
     referenced: list[str] = []
 
     def _emit_segment(header: str, recs: list, weight_of, suffix_of=None) -> None:
-        """Append a segment (header + rows) respecting the token budget.
-        Empty `recs` skips the whole segment (header included)."""
+        """Append a segment (header + rows) respecting the character budget.
+        Empty `recs` skips the whole segment (header included).
+        When `unlimited` (budget <= 0) nothing is ever dropped."""
         nonlocal used
         if not recs:
             return
-        if used + len(header) > BREATH_TOKEN_BUDGET:
+        if not unlimited and used + len(header) > effective_budget:
             return
         lines.append(header)
         used += len(header)
@@ -548,7 +566,7 @@ def _compose_breath_output(
             line = _fmt(rec, weight_of(rec))
             if suffix_of is not None:
                 line += suffix_of(rec)
-            if used + len(line) > BREATH_TOKEN_BUDGET:
+            if not unlimited and used + len(line) > effective_budget:
                 break
             lines.append(line)
             used += len(line)
@@ -3422,7 +3440,12 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                         limit = max(1, min(20, int(kv[6:])))
                     except ValueError:
                         pass
-            text, _ = _compose_breath_output(store, limit=limit, do_touch=False)
+            # budget=0 → unlimited. The injector renders this incrementally
+            # (memory_state.json), so a truncated payload would permanently hide
+            # whatever fell off the end; the old 3000-char cap also swallowed
+            # whole segments (header rendered, rows cut).
+            text, _ = _compose_breath_output(
+                store, limit=limit, do_touch=False, budget=0)
             body = text.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
