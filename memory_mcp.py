@@ -647,9 +647,14 @@ def _compose_breath_output(
 #   * pinned IS excluded (breath already surfaces those every cycle).
 #   * anything created inside the last 48h is excluded (the injector's own
 #     "recent memories" segment already carries it).
-#   * no activation touch: an association is a bystander, it must not reshape
-#     the weights it happened to walk past (same reasoning as /breath-hook's
-#     do_touch=False).
+#   * activation is priced by layer (2026-07-28). The active layers
+#     ('' / working / watch / core, plus pinned) keep the original zero-touch
+#     rule: an association there is a bystander and must not reshape weights
+#     breath already curates (same reasoning as /breath-hook's do_touch=False).
+#     The sunken layers (seabed / archive) get a micro-touch instead — breath
+#     never serves them and dream never scans them, so this hook is their only
+#     searchlight, and "was still in the semantic field on day N" is evidence
+#     too cheap to throw away. See ASSOCIATE_SEABED_TOUCH.
 #
 # The master switch lives here rather than in the hook so that a single source
 # of truth (app_config in memory.db) decides, and either Claude — backstage or
@@ -664,6 +669,34 @@ ASSOCIATE_MAX_CHARS: int = int(os.environ.get("ASSOCIATE_MAX_CHARS", "400"))
 ASSOCIATE_EMBED_TIMEOUT: float = float(
     os.environ.get("ASSOCIATE_EMBED_TIMEOUT", "4")
 )
+
+# Layered pricing for association hits. Only rows sitting below the waterline
+# are billed; everything the active layers do stays free.
+#
+# Sizing (derived 2026-07-28). activation_count reaches the rest of the system
+# through exactly one door: the (activation ** 0.3) factor in
+# _calc_decay_score. Nothing else reads the column — search ranks on
+# vector/keyword only — so no amount of it can feed back into who gets
+# associated next. That leaves the existing prices as the yardstick: a search
+# hit is +1.0 (a person deliberately went looking), a breath surfacing is +0.3
+# (it entered someone's context, 6h cooldown). An association is weaker than
+# both — a 15% dice roll walked past it and nobody promises it was read — so
+# 0.02 prices 50 associations at one deliberate recall. With the 24h ledger
+# cooldown a row can bill at most once a day, which caps the effect on its
+# decay_score at:
+#     7 daily hits  -> +4.0%      30 daily hits -> +15.1%
+#     90 daily hits -> +36.2%     365 daily hits -> +88.7%
+#     one or two stray hits -> +0.6% / +1.2%, invisible
+# The ^0.3 exponent keeps it self-limiting, so even the pathological case
+# never runs away. 0 disables the whole thing: not a single extra statement is
+# issued and the endpoint behaves byte for byte as it did before.
+ASSOCIATE_SEABED_TOUCH: float = float(
+    os.environ.get("ASSOCIATE_SEABED_TOUCH", "0.02")
+)
+# What counts as sunken. Named for the seabed because that is the cohort this
+# exists for, but archive rides along: breath skips both, so both would
+# otherwise accumulate no evidence at all.
+ASSOCIATE_SUNKEN_TIERS = frozenset({"seabed", "archive"})
 
 ASSOCIATE_CFG_ENABLED = "associate.enabled"
 ASSOCIATE_CFG_MAX_ITEMS = "associate.max_items"
@@ -820,6 +853,36 @@ def _associate_effective_ceiling(
                min(ASSOCIATE_MAX_ITEMS_MAX, min(wish, max_items)))
 
 
+def _associate_touch_sunken(
+    store: "MemoryStore", records: List[MemoryRecord]
+) -> int:
+    """Bill the sunken-layer rows among `records`. Returns how many were billed.
+
+    Only rows that actually made it into the reply are passed here, and only
+    the ones below the waterline pay. Deliberately narrow: activation_count and
+    nothing else. last_active stays untouched, so the decay clock keeps running
+    — this is a tally mark on a fossil, not a resurrection, and refreshing the
+    clock is what real recall (touch_memory) is for.
+    """
+    if ASSOCIATE_SEABED_TOUCH <= 0:
+        return 0
+    ids = [
+        rec.id
+        for rec in records
+        if (rec.tier or "") in ASSOCIATE_SUNKEN_TIERS and not rec.pinned
+    ]
+    if not ids:
+        return 0
+    with store._lock:
+        store.conn.executemany(
+            "UPDATE memories SET "
+            "activation_count = COALESCE(activation_count, 1.0) + ? WHERE id = ?",
+            [(ASSOCIATE_SEABED_TOUCH, mid) for mid in ids],
+        )
+        store.conn.commit()
+    return len(ids)
+
+
 def _compose_associate_output(
     store: "MemoryStore",
     *,
@@ -829,7 +892,8 @@ def _compose_associate_output(
     """Return the association lines for `query` (empty string = nothing).
 
     Reuses MemoryStore.search (BM25 + vector + MMR) verbatim, then applies the
-    association-specific filters and the cooldown ledger. How many lines come
+    association-specific filters, the cooldown ledger and the sunken-layer
+    micro-activation (_associate_touch_sunken). How many lines come
     back is itself a roll: 1..ceiling, so the texture stays uneven the way a
     stray thought is. Fewer survivors than the roll asked for is fine, zero
     included — a quiet turn is a normal result, not a failure.
@@ -884,6 +948,17 @@ def _compose_associate_output(
             picked.append(rec)
         for rec in picked:
             _associate_cooldown[rec.id] = now_ts
+
+    # Layered pricing, best-effort. The hook pipeline outranks the ledger: a
+    # locked db or any other surprise costs us the tally mark, never the line
+    # Claude was about to read.
+    try:
+        _associate_touch_sunken(store, picked)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[associate] sunken touch skipped: {type(exc).__name__}: {exc}\n"
+        )
+        sys.stderr.flush()
 
     lines = []
     for rec in picked:
@@ -3839,9 +3914,12 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
         def _handle_associate(self) -> None:
             """GET /associate?q=<text>[&limit=N] — 联想浮现 (passive RAG).
 
-            Read-only and activation-free, same reasoning as /breath-hook: the
-            consumer is an automatic hook, so surfacing must not amplify what it
-            surfaced. Returns text/plain, one line per memory; 204 whenever
+            Activation-free for the active layers, same reasoning as
+            /breath-hook: the consumer is an automatic hook, so surfacing must
+            not amplify what breath already curates. Sunken rows (seabed /
+            archive) are the exception and pay ASSOCIATE_SEABED_TOUCH — the
+            hook is the only light that ever reaches them.
+            Returns text/plain, one line per memory; 204 whenever
             nothing comes back — switch off, no survivors, or a bad day for the
             retriever all look identical to the caller, deliberately.
 
