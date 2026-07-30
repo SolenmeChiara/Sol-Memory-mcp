@@ -2073,7 +2073,11 @@ def _process_conversations(
     errors: List[str] = []
 
     for raw_idx, item in enumerate(items):
-        title, text = _bi_conv_to_text(item)
+        # _bi_conv_to_text returns (title, text, original_ts) — the third item was
+        # added on the batch_import side and this unpack was never widened, so the
+        # per-conversation path raised ValueError on its very first conversation.
+        # original_ts stays unused here (upsert_memory has no created_at override).
+        title, text, _original_ts = _bi_conv_to_text(item)
         label = (title or f"untitled #{raw_idx}")[:60]
 
         if not text.strip():
