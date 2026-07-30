@@ -1648,6 +1648,29 @@ class MemoryStore:
         self._mark_emb_dirty()
         return self._row_to_record(row)
 
+    def update_memory_fields(self, memory_id: str, fields: Dict[str, Any]) -> None:
+        """Narrow UPDATE of just the columns in *fields* (+ updated_at).
+
+        Unlike upsert_memory (which rewrites the whole row and would clobber
+        embedding / session_id / activation_count / last_active), this touches
+        nothing the caller did not name. Column names come from a fixed
+        handler-side whitelist, never from user input, so the f-string carries
+        no injection surface; every value is bound as a parameter.
+        Deliberately does NOT call _mark_emb_dirty(): the embedding column is
+        never in *fields* (the background embed worker marks it itself).
+        """
+        if not fields:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        cols = list(fields)
+        sql = (
+            f"UPDATE memories SET {', '.join(c + '=?' for c in cols)}, "
+            "updated_at=? WHERE id=?"
+        )
+        with self._lock:
+            self.conn.execute(sql, (*[fields[c] for c in cols], now, memory_id))
+            self.conn.commit()
+
     # ---- app_config (small persistent kv for runtime-dialable settings) ----
 
     def get_config(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -2676,9 +2699,15 @@ TOOLS = [
         "description": (
             "Save or update a memory record. Persist preferences, events, facts, or anything "
             "worth remembering long-term. Embedding and emotion analysis run in the background "
-            "automatically. Optional `tier` places the memory in the layered-memory architecture "
+            "automatically on create. Passing an `id` that already exists is a partial update: "
+            "every field you omit keeps its stored value (including embedding, activation count "
+            "and last-active time), so you only need to send what actually changes — "
+            "except `key` and `content`, which stay required on every call (resend the "
+            "stored text unchanged if you are only flipping a flag). "
+            "Optional `tier` places the memory in the layered-memory architecture "
             "(working/watch/core/archive/seabed; '' = ordinary). On update, an omitted `tier` "
-            "keeps the existing tier. Resolving a `working` memory auto-archives it (tier→archive)."
+            "keeps the existing tier. Passing resolved=true on a `working` memory auto-archives "
+            "it (tier→archive)."
         ),
         "inputSchema": {
             "type": "object",
@@ -2688,15 +2717,51 @@ TOOLS = [
                 "category": {
                     "type": "string",
                     "enum": ["preference", "promise", "event", "anniversary", "emotion", "habit", "boundary", "other"],
-                    "description": "Category (default: other)",
+                    "description": "Category (default: other on create). Omit to keep the current value on update.",
                 },
-                "importance": {"type": "number", "description": "0.0 to 1.0 (default 0.5)"},
+                "importance": {
+                    "type": "number",
+                    "description": (
+                        "0.0 to 1.0 (default 0.5 on create). "
+                        "Omit to keep the current value on update."
+                    ),
+                },
                 "id": {"type": "string", "description": "Optional existing memory ID to update"},
-                "valence": {"type": "number", "description": "Emotional valence 0.0~1.0 (auto-detected if omitted)"},
-                "arousal": {"type": "number", "description": "Arousal/intensity 0.0~1.0 (auto-detected if omitted)"},
-                "pinned": {"type": "boolean", "description": "Pin memory permanently (forces importance=1.0, decay_score=999)"},
-                "resolved": {"type": "boolean", "description": "Mark as resolved (reduces decay weight by 95%)"},
-                "digested": {"type": "boolean", "description": "Mark as digested (combined with resolved: reduces decay by 98%)"},
+                "valence": {
+                    "type": "number",
+                    "description": (
+                        "Emotional valence 0.0~1.0. Auto-detected on create if omitted; "
+                        "omitting it on update keeps the stored value (never re-detected)."
+                    ),
+                },
+                "arousal": {
+                    "type": "number",
+                    "description": (
+                        "Arousal/intensity 0.0~1.0. Auto-detected on create if omitted; "
+                        "omitting it on update keeps the stored value (never re-detected)."
+                    ),
+                },
+                "pinned": {
+                    "type": "boolean",
+                    "description": (
+                        "Pin memory permanently (forces importance=1.0, decay_score=999). "
+                        "Omit to keep the current value on update."
+                    ),
+                },
+                "resolved": {
+                    "type": "boolean",
+                    "description": (
+                        "Mark as resolved (reduces decay weight by 95%). "
+                        "Omit to keep the current value on update."
+                    ),
+                },
+                "digested": {
+                    "type": "boolean",
+                    "description": (
+                        "Mark as digested (combined with resolved: reduces decay by 98%). "
+                        "Omit to keep the current value on update."
+                    ),
+                },
                 "tier": {
                     "type": "string",
                     "enum": ["", "working", "watch", "core", "archive", "seabed"],
@@ -3008,18 +3073,19 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         content = str(args.get("content", "")).strip()
         if not key or not content:
             raise ValueError("key and content are required")
-        category = str(args.get("category", "other")).strip() or "other"
-        importance = max(0.0, min(1.0, float(args.get("importance", 0.5) or 0.5)))
+
+        def _given(k: str) -> bool:
+            """True only if the caller explicitly sent a non-null value.
+
+            Presence sentinel rather than truthiness, so importance=0.0 /
+            valence=0.0 / pinned=false are honoured; some MCP clients send an
+            explicit null for "not specified", which counts as omitted.
+            """
+            return k in args and args[k] is not None
+
         memory_id = str(args.get("id", "")).strip()
         if not memory_id:
             memory_id = f"mem_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
-        pinned = bool(args.get("pinned", False))
-        resolved = bool(args.get("resolved", False))
-        digested = bool(args.get("digested", False))
-        user_valence = args.get("valence")
-        user_arousal = args.get("arousal")
-        valence = float(user_valence) if user_valence is not None else 0.5
-        arousal = float(user_arousal) if user_arousal is not None else 0.3
 
         user_tier = args.get("tier")
         if user_tier is not None:
@@ -3029,26 +3095,83 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                     f"invalid tier: {user_tier!r} (valid: {sorted(VALID_TIERS)})"
                 )
 
-        # Read the pre-existing tier so it survives the upsert's full-row
-        # overwrite: upsert_memory deliberately does NOT touch tier/tier_until,
-        # so on update the old tier is preserved and on insert it defaults to ''.
+        # The pre-existing row decides the branch *and* carries the tier across:
+        # upsert_memory deliberately does NOT touch tier/tier_until, so on insert
+        # it defaults to '' and any tier change is a separate narrow write below.
         existing_rec = store.get_memory(memory_id)
+        is_update = existing_rec is not None
         prev_tier = existing_rec.tier if existing_rec else ""
         prev_tier_until = existing_rec.tier_until if existing_rec else ""
 
-        rec = store.upsert_memory(
-            memory_id=memory_id, key=key, content=content,
-            category=category, importance=importance,
-            pinned=pinned, resolved=resolved, digested=digested,
-            valence=valence, arousal=arousal,
-        )
+        resolved_given = _given("resolved")
+        resolved_val = bool(args["resolved"]) if resolved_given else False
+
+        if is_update:
+            # ---- UPDATE: narrow write of exactly the fields that were sent ----
+            # Anything omitted keeps its stored value; session_id, memory_kind,
+            # activation_count, last_active and embedding are never touched here.
+            fields: Dict[str, Any] = {"key": key, "content": content}
+            if _given("category"):
+                new_category = str(args["category"]).strip()
+                if new_category:          # empty string = "no opinion", keep old
+                    fields["category"] = new_category
+            if _given("importance"):
+                fields["importance"] = max(0.0, min(1.0, float(args["importance"])))
+            if _given("valence"):
+                fields["valence"] = float(args["valence"])
+            if _given("arousal"):
+                fields["arousal"] = float(args["arousal"])
+            if _given("pinned"):
+                fields["pinned"] = int(bool(args["pinned"]))
+            if resolved_given:
+                fields["resolved"] = int(resolved_val)
+            if _given("digested"):
+                fields["digested"] = int(bool(args["digested"]))
+            # Same invariant upsert_memory enforces: a pinned memory is max-important.
+            final_pinned = (
+                bool(args["pinned"]) if _given("pinned") else existing_rec.pinned
+            )
+            if final_pinned:
+                fields["importance"] = 1.0
+
+            store.update_memory_fields(memory_id, fields)
+            rec = store.get_memory(memory_id) or existing_rec
+            # Only re-embed when the text actually changed; emotion is never
+            # re-run on update (omitted valence/arousal = keep what's stored).
+            do_embed = content != existing_rec.content
+            write_valence = False
+            write_arousal = False
+        else:
+            # ---- CREATE: full-row upsert with defaults (unchanged behaviour) ----
+            category = str(args.get("category", "other") or "other").strip() or "other"
+            importance = (
+                max(0.0, min(1.0, float(args["importance"])))
+                if _given("importance") else 0.5
+            )
+            valence = float(args["valence"]) if _given("valence") else 0.5
+            arousal = float(args["arousal"]) if _given("arousal") else 0.3
+            rec = store.upsert_memory(
+                memory_id=memory_id, key=key, content=content,
+                category=category, importance=importance,
+                pinned=bool(args.get("pinned") or False),
+                resolved=resolved_val,
+                digested=bool(args.get("digested") or False),
+                valence=valence, arousal=arousal,
+            )
+            do_embed = True
+            # Auto-detect only the emotion axis the caller left out (an omitted
+            # arousal must not drag an explicitly given valence along with it).
+            write_valence = not _given("valence")
+            write_arousal = not _given("arousal")
 
         # ---- tier resolution (narrow write, never through upsert) ----
         final_tier = user_tier if user_tier is not None else prev_tier
         final_until = prev_tier_until
         auto_archived = False
         # Auto-archive: resolving a working memory closes the loop → biography.
-        if resolved and final_tier == "working":
+        # Requires resolved=true *in this call*, so an unrelated edit to an
+        # already-resolved working memory doesn't silently archive it.
+        if resolved_given and resolved_val and final_tier == "working":
             final_tier = "archive"
             final_until = ""
             auto_archived = True
@@ -3076,21 +3199,22 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 )
                 store.conn.commit()
 
-        do_emotion = (user_valence is None or user_arousal is None)
-
-        def _bg_update(mid: str, txt: str, run_emotion: bool) -> None:
-            emb = _call_ollama_embedding(txt)
+        def _bg_update(mid: str, txt: str, run_embed: bool,
+                       do_valence: bool, do_arousal: bool) -> None:
+            emb = _call_ollama_embedding(txt) if run_embed else []
             updates: list[str] = []
             params: list[Any] = []
             if emb:
                 updates.append("embedding=?")
                 params.append(_pack_embedding(emb))
-            if run_emotion:
+            if do_valence or do_arousal:
                 v, a = _analyze_emotion(txt)
-                updates.append("valence=?")
-                params.append(v)
-                updates.append("arousal=?")
-                params.append(a)
+                if do_valence:
+                    updates.append("valence=?")
+                    params.append(v)
+                if do_arousal:
+                    updates.append("arousal=?")
+                    params.append(a)
             if updates:
                 params.append(mid)
                 with store._lock:
@@ -3102,10 +3226,29 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 if emb:
                     store._mark_emb_dirty()
 
-        threading.Thread(target=_bg_update, args=(memory_id, content, do_emotion), daemon=True).start()
+        if do_embed or write_valence or write_arousal:
+            threading.Thread(
+                target=_bg_update,
+                args=(memory_id, content, do_embed, write_valence, write_arousal),
+                daemon=True,
+            ).start()
 
         ds = _calc_decay_score(rec)
-        note = "embedding & emotion analysis running in background"
+        bg_parts: list[str] = []
+        if do_embed:
+            bg_parts.append("embedding")
+        if write_valence and write_arousal:
+            bg_parts.append("emotion analysis")
+        elif write_valence:
+            bg_parts.append("valence detection")
+        elif write_arousal:
+            bg_parts.append("arousal detection")
+        note = (
+            " & ".join(bg_parts) + " running in background"
+            if bg_parts else "no background work"
+        )
+        if is_update:
+            note += "; unspecified fields preserved"
         if auto_archived:
             note = "working 记忆已结案，自动归档 (tier→archive)；" + note
         return [{"type": "text", "text": json.dumps({
