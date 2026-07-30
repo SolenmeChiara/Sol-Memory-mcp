@@ -40,7 +40,10 @@ LLM_BACKEND = os.environ.get("LLM_BACKEND", "openrouter").lower()
 # OpenRouter
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite-preview")
+# Keep in sync with memory_mcp.OPENROUTER_MODEL_DEFAULT and the README table —
+# /stats reports one number for "consolidation model" and it must be the one
+# this module would actually use when .env leaves OPENROUTER_MODEL unset.
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3.5-flash-lite")
 
 # Ollama fallback
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")

@@ -45,7 +45,7 @@ python memory_mcp.py --http --port 3456 --db ./memory.db
 
 | Tool | Description |
 |---|---|
-| `extmcp_save_memory` | Save/update a memory; embedding + sentiment run in a background worker |
+| `extmcp_save_memory` | Save/update a memory; embedding + sentiment run in a background worker. **Updates (with `id`) are partial since 2026-07-30**: any field you omit keeps its stored value — `category` / `importance` / `valence` / `arousal` / `pinned` / `resolved` / `digested` / `session_id` / `activation_count` are no longer reset to defaults, and the embedding is only recomputed when the content actually changes |
 | `extmcp_search_memory` | Hybrid keyword + vector search (hits bump `activation_count`) |
 | `extmcp_list_memories` | List by update time, newest first |
 | `extmcp_delete_memory` | Delete one entry |
@@ -107,6 +107,8 @@ python batch_import.py "path/to/conversations.json"
 # resume from conversation N after an interruption
 python batch_import.py "path/to/conversations.json" --start 500
 ```
+
+Extraction runs on whatever `IMPORT_PROVIDER` / `IMPORT_MODEL` say in `.env` (`ollama` by default); `--provider ollama|openrouter|gemini` and `--model NAME` override it per run.
 
 Or open [http://localhost:3456/import](http://localhost:3456/import): drop small files (≤30 MB) in, paste a local absolute path for big ones — the server starts a background task and the browser polls progress.
 
@@ -174,14 +176,34 @@ The `/breath-hook` endpoint itself is **read-only** and never activates memories
 | `OLLAMA_MODEL` | summarization / extraction model | `gemma4:e4b` |
 | `OLLAMA_EMBED_MODEL` | embedding model | `qwen3-embedding:4b` |
 | `OLLAMA_TIMEOUT` | request timeout (s) | `180` |
+| `IMPORT_PROVIDER` | which LLM extracts memories on the import path (`ollama` / `openrouter` / `gemini`) | `ollama` |
+| `IMPORT_MODEL` | extraction model; empty = each provider's own default | *(empty)* |
+| `GOOGLE_AI_STUDIO_KEY` | AI Studio key, only needed for `gemini` extraction | *(empty)* |
 | `LLM_BACKEND` | cloud-parse backend (`openrouter` = any OpenAI-compatible endpoint; `ollama` = local fallback) | `openrouter` |
 | `OPENROUTER_BASE_URL` | cloud-parse base URL (OpenAI `chat/completions`) | `https://openrouter.ai/api/v1` |
 | `OPENROUTER_API_KEY` | cloud-parse API key (empty → falls back to local ollama) | *(empty)* |
-| `OPENROUTER_MODEL` | cloud-parse model | `google/gemini-3.1-flash-lite-preview` |
+| `OPENROUTER_MODEL` | cloud-parse model | `google/gemini-3.5-flash-lite` |
 | `DECAY_LAMBDA` | decay coefficient | `0.05` |
 | `DECAY_THRESHOLD` | decay threshold | `0.3` |
 | `BREATH_TOKEN_BUDGET` | breath output length budget | `3000` |
 | `BREATH_PINNED_QUOTA` | pinned quota within breath | `2` |
+
+### One `.env` for all three LLM paths
+
+The three LLM paths — web `/import` extraction, `batch_import.py` CLI extraction, and session consolidation — all read the same `.env` next to `memory.db`. Priority is **process env > `.env` > code default**; a CLI flag (`--provider` / `--model`) still beats everything.
+
+| Variable | Which path it controls | Default |
+|---|---|---|
+| `IMPORT_PROVIDER` | extraction (web `/import` **and** `batch_import.py`) | `ollama` |
+| `IMPORT_MODEL` | extraction model name, empty = per-provider default | *(empty)* |
+| `OPENROUTER_API_KEY` | cloud key for consolidation, and for extraction when `IMPORT_PROVIDER=openrouter` | *(empty)* |
+| `GOOGLE_AI_STUDIO_KEY` | cloud key for `IMPORT_PROVIDER=gemini` only | *(empty)* |
+| `LLM_BACKEND` | consolidation backend | `openrouter` |
+| `OPENROUTER_MODEL` | consolidation model (also the extraction model when `IMPORT_PROVIDER=openrouter` and `IMPORT_MODEL` is empty) | `google/gemini-3.5-flash-lite` |
+| `OLLAMA_MODEL` | local chat model (extraction default + failover target) | `gemma4:e4b` |
+| `OLLAMA_EMBED_MODEL` | embedding model (changing it requires a full re-embed) | `qwen3-embedding:4b` |
+
+Misconfiguration degrades rather than breaks: a cloud `IMPORT_PROVIDER` whose key is missing is treated as `ollama` (one stderr warning), and a cloud extraction call that fails retries **once** on the local model for that chunk. The `/import` page shows the currently effective `extraction provider / model ｜ consolidation backend / model` line, sourced from `GET /stats` (`import_provider`, `import_model`, `consolidate_backend`, `consolidate_model`).
 
 ### Bring your own embedding model (required)
 
@@ -255,7 +277,7 @@ python memory_mcp.py --http --port 3456 --db ./memory.db
 
 | 工具 | 说明 |
 |---|---|
-| `extmcp_save_memory` | 保存/更新记忆，自动后台生成 embedding + 情感分析 |
+| `extmcp_save_memory` | 保存/更新记忆，自动后台生成 embedding + 情感分析。**2026-07-30 起带 `id` 的更新是部分更新**：没传的字段保留原值——`category` / `importance` / `valence` / `arousal` / `pinned` / `resolved` / `digested` / `session_id` / `activation_count` 不再被重置成默认值，embedding 只在正文真的变了时才重算 |
 | `extmcp_search_memory` | 关键词 + 向量混合搜索（命中后激活 activation_count） |
 | `extmcp_list_memories` | 按更新时间倒序列出 |
 | `extmcp_delete_memory` | 删除一条 |
@@ -317,6 +339,8 @@ python batch_import.py "path/to/conversations.json"
 # 中断后从第 N 个对话续跑
 python batch_import.py "path/to/conversations.json" --start 500
 ```
+
+提取用哪个模型由 `.env` 里的 `IMPORT_PROVIDER` / `IMPORT_MODEL` 决定（默认 `ollama`）；`--provider ollama|openrouter|gemini` 和 `--model 名字` 可以单次覆盖。
 
 或者打开 [http://localhost:3456/import](http://localhost:3456/import)，小文件（≤30 MB）拖入，大文件粘贴本地绝对路径——服务器会自动启动后台任务，浏览器轮询进度。
 
@@ -384,14 +408,34 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 | `OLLAMA_MODEL` | 摘要 / 提取用模型 | `gemma4:e4b` |
 | `OLLAMA_EMBED_MODEL` | embedding 模型 | `qwen3-embedding:4b` |
 | `OLLAMA_TIMEOUT` | 请求超时（秒） | `180` |
+| `IMPORT_PROVIDER` | 导入提取用哪条 LLM 通道（`ollama` / `openrouter` / `gemini`） | `ollama` |
+| `IMPORT_MODEL` | 提取模型名，留空 = 按 provider 各自默认 | *(空)* |
+| `GOOGLE_AI_STUDIO_KEY` | AI Studio key，仅 `gemini` 提取需要 | *(空)* |
 | `LLM_BACKEND` | 云端解析通道（`openrouter` = 任意 OpenAI 兼容端点；`ollama` = 本地兜底） | `openrouter` |
 | `OPENROUTER_BASE_URL` | 云端解析 base URL（OpenAI `chat/completions`） | `https://openrouter.ai/api/v1` |
 | `OPENROUTER_API_KEY` | 云端解析 API key（留空则回退本地 ollama） | *(空)* |
-| `OPENROUTER_MODEL` | 云端解析模型 | `google/gemini-3.1-flash-lite-preview` |
+| `OPENROUTER_MODEL` | 云端解析模型 | `google/gemini-3.5-flash-lite` |
 | `DECAY_LAMBDA` | 衰减系数 | `0.05` |
 | `DECAY_THRESHOLD` | 衰减阈值 | `0.3` |
 | `BREATH_TOKEN_BUDGET` | breath 输出字数预算 | `3000` |
 | `BREATH_PINNED_QUOTA` | breath 中 pinned 配额 | `2` |
+
+### 一个 `.env` 管三条 LLM 链路
+
+三条链路——网页 `/import` 提取、`batch_import.py` CLI 提取、session 合并——读的是 `memory.db` 旁边的同一个 `.env`。优先级 **进程环境变量 > `.env` > 代码默认值**；命令行显式传的 `--provider` / `--model` 仍然最高。
+
+| 变量 | 管哪条链路 | 默认 |
+|---|---|---|
+| `IMPORT_PROVIDER` | 提取（网页 `/import` **和** `batch_import.py` 共用） | `ollama` |
+| `IMPORT_MODEL` | 提取模型名，留空 = 按 provider 各自默认 | *(空)* |
+| `OPENROUTER_API_KEY` | 合并用的云端 key；`IMPORT_PROVIDER=openrouter` 时提取也用它 | *(空)* |
+| `GOOGLE_AI_STUDIO_KEY` | 仅 `IMPORT_PROVIDER=gemini` 需要 | *(空)* |
+| `LLM_BACKEND` | 合并后端 | `openrouter` |
+| `OPENROUTER_MODEL` | 合并模型（`IMPORT_PROVIDER=openrouter` 且 `IMPORT_MODEL` 为空时，提取也复用它） | `google/gemini-3.5-flash-lite` |
+| `OLLAMA_MODEL` | 本地聊天模型（提取默认值 + 降级目标） | `gemma4:e4b` |
+| `OLLAMA_EMBED_MODEL` | embedding 模型（改它必须全量重嵌） | `qwen3-embedding:4b` |
+
+配错了只降级不瘫痪：云端 provider 缺对应 key 时按 `ollama` 处理（stderr 提示一行），云端提取调用失败则该 chunk 用本地模型兜底重试**一次**。`/import` 页面常驻显示当前生效的 `提取 provider / 模型 ｜ 合并 backend / 模型`，数据来自 `GET /stats`（`import_provider`、`import_model`、`consolidate_backend`、`consolidate_model`）。
 
 ### 必须自备 embedding 模型
 

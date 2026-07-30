@@ -35,6 +35,8 @@ import numpy as np  # vectorised cosine — see requirements.txt
 # We only borrow pure-data helpers; LLM/embedding calls stay on this module's
 # functions so they share the same Ollama config.
 from batch_import import (
+    GEMINI_DEFAULT_MODEL as _BI_GEMINI_DEFAULT_MODEL,
+    _call_gemini as _bi_call_gemini,
     _conv_to_text as _bi_conv_to_text,
     _quick_count as _bi_quick_count,
     _raw_items as _bi_raw_items,
@@ -50,6 +52,19 @@ OLLAMA_BASE_URL: str = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434
 OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 OLLAMA_TIMEOUT: float = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
 OLLAMA_EMBED_MODEL: str = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:4b")
+
+# ---- Import-extraction provider (.env driven; refreshed in main() after _load_dotenv) ----
+# Which LLM the /import extraction path talks to. "ollama" (default) keeps the
+# historical local-only behaviour; "openrouter"/"gemini" send chunks to the cloud
+# and fall back to ollama once per chunk if the cloud call blows up.
+IMPORT_PROVIDER: str = os.environ.get("IMPORT_PROVIDER", "ollama")
+IMPORT_MODEL: str = os.environ.get("IMPORT_MODEL", "")
+_IMPORT_PROVIDERS = ("ollama", "openrouter", "gemini")
+OPENROUTER_BASE_URL_DEFAULT = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL_DEFAULT = "google/gemini-3.5-flash-lite"
+# Cloud extraction budget — same order of magnitude as batch_import.GEMINI_TIMEOUT.
+IMPORT_CLOUD_TIMEOUT: float = float(os.environ.get("IMPORT_CLOUD_TIMEOUT", "180"))
+
 DECAY_LAMBDA: float = float(os.environ.get("DECAY_LAMBDA", "0.05"))
 DECAY_THRESHOLD: float = float(os.environ.get("DECAY_THRESHOLD", "0.3"))
 
@@ -271,15 +286,18 @@ def _start_maintenance_daemon(store: "MemoryStore", db_path: Path) -> None:
     threading.Thread(target=_loop, daemon=True, name="maint-daemon").start()
 
 
-def _call_ollama(prompt: str, *, timeout: Optional[float] = None) -> str:
+def _call_ollama(prompt: str, *, timeout: Optional[float] = None,
+                 model: Optional[str] = None) -> str:
     """Call the local Ollama OpenAI-compatible chat completion endpoint.
 
     `timeout` overrides the global OLLAMA_TIMEOUT for callers that want a short
     leash (e.g. the scent easter egg wants ~10s, not the 180s summariser budget).
+    `model` overrides OLLAMA_MODEL for callers with their own model knob (the
+    import path honours IMPORT_MODEL the same way batch_import's CLI does).
     """
     url = f"{OLLAMA_BASE_URL.rstrip('/')}/v1/chat/completions"
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model or OLLAMA_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "temperature": 0.3,
@@ -357,6 +375,157 @@ def _ollama_reachable() -> bool:
         _OLLAMA_REACH["ts"] = now
         _OLLAMA_REACH["ok"] = 1.0 if ok else 0.0
     return ok
+
+
+# ---------------------------------------------------------------------------
+# Import extraction: provider dispatch (.env driven)
+# ---------------------------------------------------------------------------
+# A misconfigured provider must never take the whole import down, so every
+# degradation here is soft: missing key → silently behave like ollama (with one
+# warning line), cloud call raised → one ollama retry, ollama raised → the
+# caller's existing per-chunk error collection takes over.
+
+_IMPORT_WARNED: Dict[str, bool] = {}
+_IMPORT_WARN_LOCK = threading.Lock()
+
+
+def _import_warn_once(key: str, message: str) -> None:
+    """Write *message* to stderr the first time *key* is seen (per process)."""
+    with _IMPORT_WARN_LOCK:
+        if _IMPORT_WARNED.get(key):
+            return
+        _IMPORT_WARNED[key] = True
+    sys.stderr.write(message)
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _openrouter_import_model() -> str:
+    """Model name for openrouter extraction: IMPORT_MODEL wins, else OPENROUTER_MODEL."""
+    return (
+        IMPORT_MODEL.strip()
+        or os.environ.get("OPENROUTER_MODEL", "").strip()
+        or OPENROUTER_MODEL_DEFAULT
+    )
+
+
+def _gemini_import_model() -> str:
+    """Model name for gemini extraction: IMPORT_MODEL wins, else batch_import's default."""
+    return IMPORT_MODEL.strip() or _BI_GEMINI_DEFAULT_MODEL
+
+
+def _effective_import_provider() -> str:
+    """IMPORT_PROVIDER, with unknown values and key-less cloud providers demoted
+    to "ollama" (one stderr warning each). Never raises."""
+    provider = (IMPORT_PROVIDER or "ollama").strip().lower()
+    if provider not in _IMPORT_PROVIDERS:
+        _import_warn_once(
+            f"bad-provider:{provider}",
+            f"[memory-mcp] IMPORT_PROVIDER={provider!r} is not one of "
+            f"{'/'.join(_IMPORT_PROVIDERS)} — falling back to ollama\n",
+        )
+        return "ollama"
+    if provider == "openrouter" and not os.environ.get("OPENROUTER_API_KEY", "").strip():
+        _import_warn_once(
+            "no-openrouter-key",
+            "[memory-mcp] IMPORT_PROVIDER=openrouter but OPENROUTER_API_KEY is "
+            "missing — import extraction falls back to ollama\n",
+        )
+        return "ollama"
+    if provider == "gemini" and not os.environ.get("GOOGLE_AI_STUDIO_KEY", "").strip():
+        _import_warn_once(
+            "no-gemini-key",
+            "[memory-mcp] IMPORT_PROVIDER=gemini but GOOGLE_AI_STUDIO_KEY is "
+            "missing — import extraction falls back to ollama\n",
+        )
+        return "ollama"
+    return provider
+
+
+def _import_model_name(provider: Optional[str] = None) -> str:
+    """Resolved model name actually used by *provider* (default: effective one)."""
+    prov = provider or _effective_import_provider()
+    if prov == "openrouter":
+        return _openrouter_import_model()
+    if prov == "gemini":
+        return _gemini_import_model()
+    return IMPORT_MODEL.strip() or OLLAMA_MODEL
+
+
+def _call_openrouter(prompt: str, *, model: Optional[str] = None,
+                     timeout: Optional[float] = None) -> str:
+    """Call OpenRouter's OpenAI-compatible chat/completions endpoint.
+
+    Raises RuntimeError on HTTP errors / empty completions so the caller can log
+    and fall back to the local model.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY not set (env or .env)")
+    base = (
+        os.environ.get("OPENROUTER_BASE_URL", "").strip() or OPENROUTER_BASE_URL_DEFAULT
+    ).rstrip("/")
+    payload = {
+        "model": model or _openrouter_import_model(),
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "temperature": 0.3,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            req, timeout=IMPORT_CLOUD_TIMEOUT if timeout is None else timeout
+        ) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"OpenRouter HTTP {e.code}: {raw}") from None
+    parsed = json.loads(body)
+    choices = parsed.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {str(parsed)[:300]}")
+    text = (choices[0].get("message") or {}).get("content") or ""
+    if not text.strip():
+        raise RuntimeError("OpenRouter returned empty content")
+    return text
+
+
+def _call_import_llm(prompt: str) -> str:
+    """按 IMPORT_PROVIDER 分发提取调用；云端失败降级本地 Ollama 兜底一次。"""
+    provider = _effective_import_provider()
+    if provider == "ollama":
+        # IMPORT_MODEL applies to the local model too, so the /stats line and
+        # batch_import --provider ollama agree with what actually runs.
+        return _call_ollama(prompt, model=_import_model_name("ollama"))
+    try:
+        if provider == "openrouter":
+            return _call_openrouter(prompt)
+        return _bi_call_gemini(
+            prompt,
+            os.environ.get("GOOGLE_AI_STUDIO_KEY", "").strip(),
+            _gemini_import_model(),
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[memory-mcp] import extract via {provider} failed ({exc}) — "
+            f"falling back to ollama for this chunk\n"
+        )
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return _call_ollama(prompt)
 
 
 _EMOTION_PROMPT = (
@@ -2096,7 +2265,7 @@ def _process_conversations(
 
         for chunk in chunks:
             try:
-                raw = _call_ollama(_IMPORT_EXTRACT_TMPL.format(chunk=chunk))
+                raw = _call_import_llm(_IMPORT_EXTRACT_TMPL.format(chunk=chunk))
                 ext_items = _parse_json_list(raw)
             except Exception as exc:
                 errors.append(f"#{raw_idx} chunk: {exc}")
@@ -2315,6 +2484,7 @@ h1{color:var(--fg);font-size:28px;margin-bottom:6px}
     <div id="statsBlock" style="font-family:monospace;font-size:13px;line-height:1.8;color:var(--label)">loading…</div>
     <div style="font-size:12px;color:var(--formats)">每 5s 刷新</div>
   </div>
+  <div id="modelLine" style="margin-top:10px;font-family:monospace;font-size:12px;color:var(--formats)">模型: 读取中…</div>
 </div>
 
 <div class="card">
@@ -2362,6 +2532,7 @@ const pf=document.getElementById('progFill'),ra=document.getElementById('resultA
 const pathIn=document.getElementById('pathInput'),pathBtn=document.getElementById('pathSubmit');
 const stLine=document.getElementById('statusLine');
 const statsBlock=document.getElementById('statsBlock');
+const modelLine=document.getElementById('modelLine');
 const btnReindex=document.getElementById('btnReindex'),btnConsolidate=document.getElementById('btnConsolidate'),btnPrune=document.getElementById('btnPrune');
 const consolidateHint=document.getElementById('consolidateHint');
 const SIZE_LIMIT=30*1024*1024;
@@ -2390,7 +2561,12 @@ async function refreshStats(){
     btnPrune.textContent=s.digested_stale>0
       ? `清理过期归档 (${s.digested_stale})`
       : '清理过期归档';
-    mergeMode = !s.analysis_ready ? 'none' : (s.openrouter_key_present ? 'cloud' : 'local');
+    modelLine.textContent=
+      `提取: ${s.import_provider||'?'} / ${s.import_model||'?'}`+
+      `  ｜  合并: ${s.consolidate_backend||'?'} / ${s.consolidate_model||'?'}`;
+    const mergeReady=(s.consolidate_ready!==undefined)?s.consolidate_ready:s.analysis_ready;
+    mergeMode = !mergeReady ? 'none'
+      : ((s.openrouter_key_present && s.consolidate_backend!=='ollama') ? 'cloud' : 'local');
     if(mergeMode==='none'){
       // 没有任何解析通道：云端 key 不在，本地 ollama 也不可达
       btnConsolidate.disabled=true;btnConsolidate.style.opacity='0.4';
@@ -4646,10 +4822,39 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                 ]
 
             # Readiness signals for the import UI. embedding needs a reachable
-            # ollama; cloud analysis (consolidate/extract) needs *either* a cloud
-            # key or a reachable local ollama fallback.
+            # ollama; extraction follows IMPORT_PROVIDER (see below); the merge
+            # button needs *either* a cloud key or a reachable local ollama.
             openrouter_present = bool(os.environ.get("OPENROUTER_API_KEY"))
+            gemini_present = bool(os.environ.get("GOOGLE_AI_STUDIO_KEY"))
             ollama_ok = _ollama_reachable()
+
+            # Which LLM each of the two pipelines would actually use right now.
+            # _effective_import_provider() already demotes key-less cloud
+            # providers to ollama, so these values are what really runs.
+            import_provider = _effective_import_provider()
+            import_model = _import_model_name(import_provider)
+            consolidate_backend = (
+                os.environ.get("LLM_BACKEND", "openrouter") or "openrouter"
+            ).strip().lower()
+            consolidate_model = (
+                OLLAMA_MODEL if consolidate_backend == "ollama"
+                else (os.environ.get("OPENROUTER_MODEL", "").strip()
+                      or OPENROUTER_MODEL_DEFAULT)
+            )
+
+            # Extraction readiness follows IMPORT_PROVIDER; cloud providers stay
+            # "ready" without their key because they degrade to ollama.
+            configured_provider = (IMPORT_PROVIDER or "").strip().lower()
+            if configured_provider == "openrouter":
+                analysis_ready = openrouter_present or ollama_ok
+            elif configured_provider == "gemini":
+                analysis_ready = gemini_present or ollama_ok
+            else:
+                analysis_ready = ollama_ok
+            # The merge button has its own channel (openrouter key or ollama) —
+            # keep it independent of the extraction provider.
+            consolidate_ready = openrouter_present or ollama_ok
+
             self._send_json(200, {
                 "long_term_count": long_term,
                 "with_embedding": with_emb,
@@ -4662,7 +4867,13 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                 "prune_days": DIGESTED_PRUNE_DAYS,
                 "active_tasks": active,
                 "openrouter_key_present": openrouter_present,
-                "analysis_ready": openrouter_present or ollama_ok,
+                "gemini_key_present": gemini_present,
+                "import_provider": import_provider,
+                "import_model": import_model,
+                "consolidate_backend": consolidate_backend,
+                "consolidate_model": consolidate_model,
+                "analysis_ready": analysis_ready,
+                "consolidate_ready": consolidate_ready,
                 "embedding_ready": ollama_ok,
             })
 
@@ -4850,7 +5061,7 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
 
             for i, chunk in enumerate(chunks):
                 try:
-                    raw = _call_ollama(_IMPORT_EXTRACT_TMPL.format(chunk=chunk))
+                    raw = _call_import_llm(_IMPORT_EXTRACT_TMPL.format(chunk=chunk))
                     items = _parse_json_list(raw)
                 except Exception as e:
                     errors.append(f"chunk {i}: {e}")
@@ -5007,6 +5218,7 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
 def main() -> None:
     import argparse
     global OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_EMBED_MODEL, OLLAMA_TIMEOUT, SUMMARIZE_DRY_RUN
+    global IMPORT_PROVIDER, IMPORT_MODEL
 
     # Subcommand mode: `python memory_mcp.py breath [--limit N] [--db PATH]`
     # Used by SessionStart hook as a fallback when HTTP server isn't running.
@@ -5079,6 +5291,17 @@ def main() -> None:
     # win. Otherwise the wizard's non-default OLLAMA_EMBED_MODEL is ignored by the
     # server and the embed worker mixes dimensions with reindex.
     OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_EMBED_MODEL)
+    # Same story for the import-extraction provider — no CLI flag, so .env always
+    # wins over the import-time snapshot. This block runs before the stdio/http
+    # branch below, so both transports see identical .env-driven config.
+    IMPORT_PROVIDER = os.environ.get("IMPORT_PROVIDER", IMPORT_PROVIDER)
+    IMPORT_MODEL = os.environ.get("IMPORT_MODEL", IMPORT_MODEL)
+    # Emit the demotion warning (if any) once at startup rather than mid-import.
+    _eff_provider = _effective_import_provider()
+    sys.stderr.write(
+        f"[memory-mcp] import extraction: provider={_eff_provider} "
+        f"model={_import_model_name(_eff_provider)}\n"
+    )
 
     store = MemoryStore(db_path)
 

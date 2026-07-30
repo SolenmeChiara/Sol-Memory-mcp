@@ -3,7 +3,10 @@
 
 Usage:
     python batch_import.py "path/to/export.json" [--db memory.db] [--start 0] [--limit 10] [--dry-run]
-    python batch_import.py export.zip --provider gemini --model gemini-3.1-flash-lite-preview
+    python batch_import.py export.zip --provider gemini --model gemini-3.5-flash-lite
+
+--provider/--model default to IMPORT_PROVIDER/IMPORT_MODEL from .env (see README);
+an explicit flag always wins.
 """
 from __future__ import annotations
 
@@ -40,12 +43,22 @@ N_EMBED_WORKERS = 2
 # Gemini configuration
 # ---------------------------------------------------------------------------
 
-GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
 GEMINI_TIMEOUT: float = float(os.environ.get("GEMINI_TIMEOUT", "180"))
 # 8192 leaves enough headroom for thinking models (gemini-3.5-flash, gemini-3-*)
 # to reason AND still emit a multi-memory JSON array. Non-thinking lite models
 # stop well below this cap on their own.
-GEMINI_MAX_OUTPUT_TOKENS = 8192
+GEMINI_MAX_OUTPUT_TOKENS = 20000
+
+# ---------------------------------------------------------------------------
+# OpenRouter configuration
+# ---------------------------------------------------------------------------
+
+OPENROUTER_BASE_URL_DEFAULT = "https://openrouter.ai/api/v1"
+OPENROUTER_DEFAULT_MODEL = "google/gemini-3.5-flash-lite"
+OPENROUTER_TIMEOUT: float = float(os.environ.get("OPENROUTER_TIMEOUT", "180"))
+
+PROVIDERS = ("ollama", "gemini", "openrouter")
 
 # Session-mode chunking. Gemini handles 1M-token context so we treat each
 # conversation as a single chunk; only split if total chars exceed this.
@@ -153,12 +166,56 @@ def _call_gemini(prompt: str, api_key: str, model: str = GEMINI_DEFAULT_MODEL) -
     return text
 
 
+def _call_openrouter(prompt: str, api_key: str,
+                     model: str = OPENROUTER_DEFAULT_MODEL) -> str:
+    """Call OpenRouter's OpenAI-compatible chat/completions endpoint.
+
+    Deliberately a standalone twin of memory_mcp._call_openrouter — batch_import
+    is imported *by* memory_mcp, so it must not import back.
+    """
+    base = (_load_env_var("OPENROUTER_BASE_URL") or OPENROUTER_BASE_URL_DEFAULT).rstrip("/")
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "temperature": 0.3,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OPENROUTER_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"OpenRouter HTTP {e.code}: {raw}") from None
+    parsed = json.loads(body)
+    choices = parsed.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {str(parsed)[:300]}")
+    text = (choices[0].get("message") or {}).get("content") or ""
+    if not text.strip():
+        raise RuntimeError("OpenRouter returned empty content")
+    return text
+
+
 def _call_llm(provider: str, prompt: str, model: str, api_key: Optional[str]) -> str:
-    """Provider dispatcher: route to Gemini or Ollama based on `provider`."""
+    """Provider dispatcher: route to Gemini, OpenRouter or Ollama."""
     if provider == "gemini":
         if not api_key:
             raise RuntimeError("GOOGLE_AI_STUDIO_KEY not set (env or .env)")
         return _call_gemini(prompt, api_key, model)
+    if provider == "openrouter":
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY not set (env or .env)")
+        return _call_openrouter(prompt, api_key, model)
     return _call_ollama(prompt, model)
 
 
@@ -611,6 +668,7 @@ def main() -> None:
     # process-env > .env > code default because _load_dotenv uses setdefault and
     # os.environ.get() below reads the already-populated environment.
     global OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_EMBED_MODEL, OLLAMA_TIMEOUT, GEMINI_TIMEOUT
+    global OPENROUTER_TIMEOUT
     try:
         from consolidate_sessions import _load_dotenv
         _load_dotenv(SCRIPT_DIR)
@@ -621,6 +679,7 @@ def main() -> None:
     OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_EMBED_MODEL)
     OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", str(OLLAMA_TIMEOUT)))
     GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", str(GEMINI_TIMEOUT)))
+    OPENROUTER_TIMEOUT = float(os.environ.get("OPENROUTER_TIMEOUT", str(OPENROUTER_TIMEOUT)))
 
     parser = argparse.ArgumentParser(
         description="Batch import conversation exports into the memory SQLite database"
@@ -640,12 +699,15 @@ def main() -> None:
         help="Call LLM and show what would be inserted, but skip all DB writes",
     )
     parser.add_argument(
-        "--provider", choices=["ollama", "gemini"], default="ollama",
-        help="LLM backend for extraction (default: ollama)",
+        "--provider", choices=list(PROVIDERS), default=None,
+        help="LLM backend for extraction. Default: IMPORT_PROVIDER from env/.env, "
+             "else ollama",
     )
     parser.add_argument(
         "--model", default=None,
-        help="Model name. Default: gemma4:e4b (ollama) or gemini-3.1-flash-lite-preview (gemini)",
+        help="Model name. Default: IMPORT_MODEL from env/.env, else the provider's "
+             f"own default ({OLLAMA_MODEL} / {GEMINI_DEFAULT_MODEL} / "
+             f"OPENROUTER_MODEL or {OPENROUTER_DEFAULT_MODEL})",
     )
     parser.add_argument(
         "--session-mode", action=argparse.BooleanOptionalAction, default=True,
@@ -654,16 +716,45 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Resolve model default per provider
-    if args.model is None:
-        args.model = GEMINI_DEFAULT_MODEL if args.provider == "gemini" else OLLAMA_MODEL
+    # ---- Provider / model resolution ----
+    # Priority for both: explicit CLI flag > env|.env (IMPORT_PROVIDER /
+    # IMPORT_MODEL) > per-provider code default. argparse defaults are None so
+    # "was it passed?" is unambiguous.
+    if args.provider is None:
+        env_provider = (_load_env_var("IMPORT_PROVIDER") or "").strip().lower()
+        if env_provider and env_provider not in PROVIDERS:
+            print(
+                f"Error: invalid IMPORT_PROVIDER={env_provider!r} in env/.env "
+                f"(expected one of {'|'.join(PROVIDERS)})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        args.provider = env_provider or "ollama"
 
-    # Gemini auth
-    gemini_key: Optional[str] = None
+    if args.model is None:
+        env_model = (_load_env_var("IMPORT_MODEL") or "").strip()
+        if env_model:
+            args.model = env_model
+        elif args.provider == "gemini":
+            args.model = GEMINI_DEFAULT_MODEL
+        elif args.provider == "openrouter":
+            args.model = (
+                _load_env_var("OPENROUTER_MODEL") or ""
+            ).strip() or OPENROUTER_DEFAULT_MODEL
+        else:
+            args.model = OLLAMA_MODEL
+
+    # Cloud auth (ollama needs none)
+    api_key: Optional[str] = None
     if args.provider == "gemini":
-        gemini_key = _load_env_var("GOOGLE_AI_STUDIO_KEY")
-        if not gemini_key:
+        api_key = _load_env_var("GOOGLE_AI_STUDIO_KEY")
+        if not api_key:
             print("Error: GOOGLE_AI_STUDIO_KEY not in env or .env files", file=sys.stderr)
+            sys.exit(1)
+    elif args.provider == "openrouter":
+        api_key = _load_env_var("OPENROUTER_API_KEY")
+        if not api_key:
+            print("Error: OPENROUTER_API_KEY not in env or .env files", file=sys.stderr)
             sys.exit(1)
 
     extract_tmpl = _SESSION_EXTRACT_TMPL if args.session_mode else _IMPORT_EXTRACT_TMPL
@@ -758,7 +849,7 @@ def main() -> None:
         for chunk in chunks:
             try:
                 raw_resp = _call_llm(args.provider, extract_tmpl.format(chunk=chunk),
-                                     args.model, gemini_key)
+                                     args.model, api_key)
                 items = _parse_json_list(raw_resp)
             except Exception as exc:
                 errors += 1
