@@ -726,30 +726,14 @@ def _compose_breath_output(
             f"V{rec.valence:.1f}/A{rec.arousal:.1f}] {flat_key}: {flat}"
         )
 
-    lines: list[str] = []
+    def _render(rec, weight_of, suffix_of) -> str:
+        line = _fmt(rec, weight_of(rec))
+        if suffix_of is not None:
+            line += suffix_of(rec)
+        return line
+
     used = 0
     referenced: list[str] = []
-
-    def _emit_segment(header: str, recs: list, weight_of, suffix_of=None) -> None:
-        """Append a segment (header + rows) respecting the character budget.
-        Empty `recs` skips the whole segment (header included).
-        When `unlimited` (budget <= 0) nothing is ever dropped."""
-        nonlocal used
-        if not recs:
-            return
-        if not unlimited and used + len(header) > effective_budget:
-            return
-        lines.append(header)
-        used += len(header)
-        for rec in recs:
-            line = _fmt(rec, weight_of(rec))
-            if suffix_of is not None:
-                line += suffix_of(rec)
-            if not unlimited and used + len(line) > effective_budget:
-                break
-            lines.append(line)
-            used += len(line)
-            referenced.append(rec.id)
 
     def _decay_w(rec) -> str:
         if rec.decay_score <= 0.0:
@@ -760,14 +744,76 @@ def _compose_breath_output(
         tu = rec.tier_until or ""
         return f" (watch until {tu[5:10]})" if len(tu) >= 10 else ""
 
-    _emit_segment("=== PINNED ===", pinned_recs, lambda r: "999.00")
-    _emit_segment("\n=== CORE ===", core_recs, _decay_w)
     working_header = "\n=== WORKING ==="
     if working_total > BREATH_WORKING_QUOTA:
         working_header = f"\n=== WORKING ({len(working_recs)}/{working_total}) ==="
-    _emit_segment(working_header, working_recs, _decay_w)
-    _emit_segment("\n=== WATCH ===", watch_recs, _decay_w, suffix_of=_watch_suffix)
-    _emit_segment("\n=== TOP UNRESOLVED (by decay) ===", un_picked, _decay_w)
+
+    segments = [
+        ("=== PINNED ===", pinned_recs, lambda r: "999.00", None),
+        ("\n=== CORE ===", core_recs, _decay_w, None),
+        (working_header, working_recs, _decay_w, None),
+        ("\n=== WATCH ===", watch_recs, _decay_w, _watch_suffix),
+        ("\n=== TOP UNRESOLVED (by decay) ===", un_picked, _decay_w, None),
+    ]
+    rendered = [
+        [_render(rec, weight_of, suffix_of) for rec in recs]
+        for (_h, recs, weight_of, suffix_of) in segments
+    ]
+
+    rows_out: list[list[tuple[int, str]]] = [[] for _ in segments]
+    header_charged = [False] * len(segments)
+
+    def _try_row(i: int, j: int) -> bool:
+        """Place row j of segment i if the budget allows.
+
+        The segment header is charged lazily, on the first row that actually
+        lands, so a segment whose rows all get dropped never emits a bare
+        header — a headerless tier reads as truncated, whereas an empty-headed
+        one reads as "that tier has nothing in it", which was the 2026-08-08 bug.
+        """
+        nonlocal used
+        line = rendered[i][j]
+        extra = 0 if header_charged[i] else len(segments[i][0])
+        if not unlimited and used + extra + len(line) > effective_budget:
+            return False
+        if not header_charged[i]:
+            header_charged[i] = True
+            used += extra
+        rows_out[i].append((j, line))
+        used += len(line)
+        referenced.append(segments[i][1][j].id)
+        return True
+
+    # Pass 1 — seed every non-empty segment with one row, in segment order.
+    # This is the guarantee: a fat leading tier can no longer starve the tiers
+    # below it. (Before this, PINNED + CORE alone ran ~2400 of the 3000-char cap
+    # and WATCH / TOP never surfaced a single row.) If a segment's top row is
+    # itself too fat for what is left, fall through to its next row rather than
+    # dropping the whole tier — one row of a tier beats none.
+    seeded: list[int] = [-1] * len(segments)
+    for i, rows in enumerate(rendered):
+        for j in range(len(rows)):
+            if _try_row(i, j):
+                seeded[i] = j
+                break
+
+    # Pass 2 — spend what is left, still in segment order, so the tiers that
+    # matter most deepen first. Budget freed by a short leading tier is not
+    # wasted; when unlimited, every remaining row lands here.
+    for i, rows in enumerate(rendered):
+        for j in range(len(rows)):
+            if j == seeded[i]:
+                continue
+            if not _try_row(i, j):
+                break
+
+    lines: list[str] = []
+    for i, rows in enumerate(rows_out):
+        if rows:
+            lines.append(segments[i][0])
+            # Pass 1 may have seeded a later row than pass 2 back-fills, so
+            # restore the tier's own ordering before rendering.
+            lines.extend(line for _j, line in sorted(rows, key=lambda t: t[0]))
 
     text = "\n".join(lines)
 
