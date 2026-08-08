@@ -4,6 +4,12 @@
 Usage:
     python batch_import.py "path/to/export.json" [--db memory.db] [--start 0] [--limit 10] [--dry-run]
     python batch_import.py export.zip --provider gemini --model gemini-3.5-flash-lite
+    python batch_import.py ~/.claude/projects/<slug>/<session-uuid>.jsonl
+    python batch_import.py ~/.claude/projects/<slug>/          # every session in the folder
+
+Accepted inputs: a claude.ai / ChatGPT / plugin JSON export, a claude.ai bulk
+export .zip, a single Claude Code session transcript (.jsonl), or a directory of
+such transcripts.
 
 --provider/--model default to IMPORT_PROVIDER/IMPORT_MODEL from .env (see README);
 an explicit flag always wins.
@@ -516,6 +522,225 @@ def _conv_to_text(conv: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Claude Code session transcripts (.jsonl)
+# ---------------------------------------------------------------------------
+# Claude Code stores one session per file under
+# ~/.claude/projects/<path-slug>/<session-uuid>.jsonl. It is JSON Lines — one
+# event object per line — so json.load() on the whole file always fails.
+#
+# Most event types are harness bookkeeping (file-history-snapshot, attachment,
+# queue-operation, mode, bridge-session, last-prompt, system, ai-title, …); only
+# `user` and `assistant` events carry conversation text. We fold a session into
+# the generic {"title", "created_at", "messages": [{"role", "content"}]} shape,
+# which detect_format() already recognises as "plugin_single" and _conv_to_text()
+# already knows how to flatten — no changes needed downstream.
+
+_CC_TEXT_EVENT_TYPES = ("user", "assistant")
+
+# <system-reminder> blocks are runtime injections (memory age notices, tool
+# hints, skill nudges), not something either side said.
+_CC_SYSREM_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+# "[Image #3]" marks where a pasted image sat inside the user's turn.
+_CC_IMAGE_PLACEHOLDER_RE = re.compile(r"\[Image #\d+\]")
+
+# Slash-command echoes, their stdout, local-command caveats and background-task
+# notifications are all plumbing typed *at* Claude, never by the human.
+_CC_DROP_MARKERS = (
+    "<command-name>",
+    "<command-message>",
+    "<local-command-stdout>",
+    "<local-command-caveat>",
+    "<task-notification>",
+)
+
+_CC_DROP_EXACT = (
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+)
+
+
+def _cc_clean_text(raw: Any) -> str:
+    """Strip runtime injections from one text fragment; "" means drop the turn."""
+    if not isinstance(raw, str):
+        return ""
+    text = _CC_SYSREM_RE.sub("", raw).strip()
+    if not text:
+        return ""
+    if any(marker in text for marker in _CC_DROP_MARKERS):
+        return ""
+    if text in _CC_DROP_EXACT:
+        return ""
+    # A turn that was nothing but image placeholders carries no words.
+    if not _CC_IMAGE_PLACEHOLDER_RE.sub("", text).strip():
+        return ""
+    return text
+
+
+def _cc_blocks_to_text(content: Any) -> str:
+    """Join the plain-text parts of one Claude Code message.
+
+    `thinking`, `tool_use`, `tool_result`, `image` and `document` blocks are
+    dropped — the first is private reasoning, the rest are tool noise. A user
+    event whose content is a bare string is the normal human turn.
+    """
+    if isinstance(content, str):
+        return _cc_clean_text(content)
+    if not isinstance(content, list):
+        return ""
+    pieces: List[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        cleaned = _cc_clean_text(block.get("text"))
+        if cleaned:
+            pieces.append(cleaned)
+    return "\n".join(pieces)
+
+
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    """Parse a JSON Lines file into dicts, tolerating blank/truncated lines.
+
+    A session file being appended to by a live Claude Code process can end
+    mid-line, so an unparseable line is skipped rather than fatal.
+    """
+    events: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                events.append(obj)
+    return events
+
+
+def _looks_like_cc_session(events: List[Dict[str, Any]]) -> bool:
+    """True when these JSONL records look like a Claude Code transcript."""
+    for ev in events:
+        if (
+            ev.get("type") in _CC_TEXT_EVENT_TYPES
+            and isinstance(ev.get("message"), dict)
+            and ("uuid" in ev or "sessionId" in ev)
+        ):
+            return True
+    return False
+
+
+def cc_session_to_conversation(
+    events: List[Dict[str, Any]], fallback_title: str = ""
+) -> Optional[Dict[str, Any]]:
+    """Fold one Claude Code session's events into a generic conversation dict.
+
+    Returns None when the session holds no actual dialogue (e.g. a file that is
+    nothing but a /clear echo and a couple of snapshots), so callers can skip it
+    instead of paying for an LLM call on an empty transcript.
+
+    Consecutive turns from the same speaker are merged with a blank line, because
+    one assistant reply is written out as several events (thinking, text, several
+    tool_use) and would otherwise read as a dozen separate "assistant:" lines.
+    Turn order is preserved exactly as recorded.
+    """
+    messages: List[Dict[str, str]] = []
+    title = ""
+    first_turn_ts: Optional[str] = None
+    first_any_ts: Optional[str] = None
+
+    for ev in events:
+        ev_type = ev.get("type")
+
+        if ev_type == "ai-title":
+            candidate = str(ev.get("aiTitle") or "").strip()
+            if candidate:
+                title = candidate  # several may appear; the last one is current
+            continue
+        if ev_type == "summary":  # older Claude Code builds titled sessions here
+            candidate = str(ev.get("summary") or "").strip()
+            if candidate and not title:
+                title = candidate
+            continue
+
+        if first_any_ts is None:
+            first_any_ts = _normalize_iso_ts(ev.get("timestamp"))
+
+        if ev_type not in _CC_TEXT_EVENT_TYPES:
+            continue
+        if first_turn_ts is None:
+            first_turn_ts = _normalize_iso_ts(ev.get("timestamp"))
+
+        # isMeta: harness-authored pseudo-user text (caveats, "[Image: source:
+        # …]" notes, skill bodies). isSidechain: a subagent's transcript (newer
+        # builds file these under <session>/subagents/ instead, but older ones
+        # inlined them). isCompactSummary: an auto-recap of turns that are
+        # already in this same file.
+        if ev.get("isMeta") or ev.get("isSidechain") or ev.get("isCompactSummary"):
+            continue
+
+        message = ev.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or ev_type)
+        text = _cc_blocks_to_text(message.get("content"))
+        if not text:
+            continue
+        if messages and messages[-1]["role"] == role:
+            messages[-1]["content"] += "\n\n" + text
+        else:
+            messages.append({"role": role, "content": text})
+
+    if not messages:
+        return None
+    return {
+        "title": title or fallback_title,
+        "created_at": first_turn_ts or first_any_ts,
+        "messages": messages,
+    }
+
+
+def _load_single_export(path: Path) -> Any:
+    """Read one non-zip export file into the shape detect_format() expects.
+
+    Ordinary JSON exports load as before. A .jsonl suffix — or a JSON parse
+    failure on any other suffix — sends the file down the Claude Code session
+    path. Returns [] (detect_format → "empty") for a session with no dialogue.
+    """
+    json_error: Optional[json.JSONDecodeError] = None
+    if path.suffix.lower() != ".jsonl":
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError as exc:
+            json_error = exc
+
+    events = _read_jsonl(path)
+    if not _looks_like_cc_session(events):
+        if json_error is not None:
+            raise json_error
+        raise ValueError(
+            f"{path.name}: not a JSON export and not a Claude Code session "
+            f"transcript ({len(events)} JSONL record(s), none of them a "
+            f"user/assistant message event)"
+        )
+
+    conv = cc_session_to_conversation(events, fallback_title=path.stem)
+    if conv is None:
+        print(
+            f"Claude Code session: {len(events)} event(s), no dialogue "
+            f"— nothing to import"
+        )
+        return []
+    print(
+        f"Claude Code session: {len(events)} event(s) → "
+        f"{len(conv['messages'])} turn(s), title {conv['title']!r}"
+    )
+    return conv
+
+
+# ---------------------------------------------------------------------------
 # Database (schema identical to memory_mcp.py MemoryStore)
 # ---------------------------------------------------------------------------
 
@@ -684,7 +909,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Batch import conversation exports into the memory SQLite database"
     )
-    parser.add_argument("file", help="Path to the JSON or .zip export file")
+    parser.add_argument(
+        "file",
+        help="Path to a JSON/.zip export, a Claude Code session .jsonl, "
+             "or a directory of session .jsonl files",
+    )
     parser.add_argument("--db", default="memory.db", help="SQLite database path (default: ./memory.db)")
     parser.add_argument(
         "--start", type=int, default=0,
@@ -766,25 +995,54 @@ def main() -> None:
         print(f"Error: file not found: {json_path}", file=sys.stderr)
         sys.exit(1)
 
-    size_mb = json_path.stat().st_size / 1024 / 1024
-    print(f"Loading {json_path.name} ({size_mb:.1f} MB)…")
-    sys.stdout.flush()
-    if json_path.suffix.lower() == ".zip":
-        # Claude.ai bulk exports ship as a zip — read conversations.json directly
-        # without unpacking to disk.
-        with zipfile.ZipFile(json_path) as zf:
-            inner_name = next(
-                (n for n in zf.namelist() if n.endswith("conversations.json")),
-                None,
-            )
-            if inner_name is None:
-                print(f"Error: no conversations.json inside {json_path}", file=sys.stderr)
-                sys.exit(1)
-            with zf.open(inner_name) as f:
-                data = json.load(f)
+    if json_path.is_dir():
+        # A Claude Code project folder: ~/.claude/projects/<slug>/. Non-recursive
+        # on purpose — subagent transcripts live in <session-uuid>/subagents/ and
+        # are duplicated detail, not conversations of their own.
+        session_files = sorted(json_path.glob("*.jsonl"))
+        if not session_files:
+            print(f"Error: no .jsonl files in {json_path}", file=sys.stderr)
+            sys.exit(1)
+        size_mb = sum(p.stat().st_size for p in session_files) / 1024 / 1024
+        print(f"Loading {len(session_files)} session file(s) from "
+              f"{json_path.name}/ ({size_mb:.1f} MB)…")
+        sys.stdout.flush()
+        data = []
+        empty = 0
+        for session_path in session_files:
+            events = _read_jsonl(session_path)
+            if not _looks_like_cc_session(events):
+                empty += 1
+                continue
+            conv = cc_session_to_conversation(events, fallback_title=session_path.stem)
+            if conv is None:
+                empty += 1
+                continue
+            # Extra key ignored by detect_format/_conv_to_text; it only exists so
+            # each memory's session_id can name the transcript it came from.
+            conv["session_file"] = session_path.stem
+            data.append(conv)
+        print(f"  → {len(data)} session(s) with dialogue, "
+              f"{empty} empty or unrecognised (skipped)")
     else:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        size_mb = json_path.stat().st_size / 1024 / 1024
+        print(f"Loading {json_path.name} ({size_mb:.1f} MB)…")
+        sys.stdout.flush()
+        if json_path.suffix.lower() == ".zip":
+            # Claude.ai bulk exports ship as a zip — read conversations.json
+            # directly without unpacking to disk.
+            with zipfile.ZipFile(json_path) as zf:
+                inner_name = next(
+                    (n for n in zf.namelist() if n.endswith("conversations.json")),
+                    None,
+                )
+                if inner_name is None:
+                    print(f"Error: no conversations.json inside {json_path}", file=sys.stderr)
+                    sys.exit(1)
+                with zf.open(inner_name) as f:
+                    data = json.load(f)
+        else:
+            data = _load_single_export(json_path)
 
     fmt = detect_format(data)
     total = _quick_count(data)
@@ -842,7 +1100,8 @@ def main() -> None:
             chunks = _chunk_conversation(text)
         total_chunks += len(chunks)
 
-        session_id = f"batch_{json_path.stem}_{raw_idx}"
+        source_stem = str(item.get("session_file") or json_path.stem)
+        session_id = f"batch_{source_stem}_{raw_idx}"
         conv_memories = 0
         errors = 0
 
