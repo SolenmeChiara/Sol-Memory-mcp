@@ -588,7 +588,7 @@ def _calc_decay_score(rec) -> float:
 # Breath composition (shared by /breath-hook endpoint, extmcp_breath tool, CLI)
 # ---------------------------------------------------------------------------
 
-BREATH_TOKEN_BUDGET = int(os.environ.get("BREATH_TOKEN_BUDGET", "3000"))
+BREATH_TOKEN_BUDGET = int(os.environ.get("BREATH_TOKEN_BUDGET", "3500"))
 BREATH_PINNED_QUOTA = int(os.environ.get("BREATH_PINNED_QUOTA", "2"))
 
 # ---- Memory tier (layered-memory architecture) ----
@@ -623,9 +623,11 @@ def _compose_breath_output(
     last_breath_at timestamp. Avoids the runaway feedback Gemini & gpt5.4 both flagged.
 
     `budget` is the character budget for the rendered segments:
-      * None (default) — fall back to the module-level BREATH_TOKEN_BUDGET.
-        This keeps the extmcp_breath tool and the CLI subcommand on the historic
-        3000-char cap so claude.ai context cost is unchanged.
+      * None (default) — fall back to the module-level BREATH_TOKEN_BUDGET,
+        3500 chars, which is what the extmcp_breath tool and the CLI subcommand
+        get. 3000 was the historic value; the five tiers need 3020 just to show
+        one row each, so it left the heaviest TOP row permanently outside the
+        door. 3500 fits every tier's first row plus the second PINNED one.
       * 0 or any negative value — UNLIMITED: no segment header and no row is
         ever dropped. Used by GET /breath-hook, whose consumer (the nudge
         injector) renders memories incrementally and therefore wants the whole
@@ -733,6 +735,7 @@ def _compose_breath_output(
         return line
 
     used = 0
+    n_lines = 0
     referenced: list[str] = []
 
     def _decay_w(rec) -> str:
@@ -770,17 +773,24 @@ def _compose_breath_output(
         lands, so a segment whose rows all get dropped never emits a bare
         header — a headerless tier reads as truncated, whereas an empty-headed
         one reads as "that tier has nothing in it", which was the 2026-08-08 bug.
+
+        `used` tracks the length of the final "\\n".join(...), separators
+        included: every element after the first costs one extra character.
+        Charging only the raw text overruns the cap once the budget is actually
+        spent to the last row, which the old single-pass version never was.
         """
-        nonlocal used
-        line = rendered[i][j]
-        extra = 0 if header_charged[i] else len(segments[i][0])
-        if not unlimited and used + extra + len(line) > effective_budget:
-            return False
+        nonlocal used, n_lines
+        add = []
         if not header_charged[i]:
-            header_charged[i] = True
-            used += extra
-        rows_out[i].append((j, line))
-        used += len(line)
+            add.append(segments[i][0])
+        add.append(rendered[i][j])
+        cost = sum(len(e) for e in add) + (len(add) if n_lines else len(add) - 1)
+        if not unlimited and used + cost > effective_budget:
+            return False
+        header_charged[i] = True
+        rows_out[i].append((j, rendered[i][j]))
+        used += cost
+        n_lines += len(add)
         referenced.append(segments[i][1][j].id)
         return True
 
