@@ -604,6 +604,110 @@ BREATH_WORKING_QUOTA = int(os.environ.get("BREATH_WORKING_QUOTA", "5"))
 BREATH_WATCH_QUOTA = int(os.environ.get("BREATH_WATCH_QUOTA", "3"))
 WATCH_DEFAULT_DAYS = int(os.environ.get("WATCH_DEFAULT_DAYS", "14"))
 
+# ---- CHRONICLE (编年) — the layered digest strip -------------------------
+# digest_rollup.py writes one summary per period under a fixed key prefix.
+# breath surfaces the newest day / week / month / year row every single time,
+# side by side, so the reader always lands with a sense of where the calendar
+# is standing. Rules that make this segment different from the other five:
+#   * fetched by key prefix, never by decay — it cannot be starved or ranked out;
+#   * never touched (activation_count untouched), so being permanently on screen
+#     cannot walk a digest up into TOP UNRESOLVED;
+#   * paid for from its own character pot, so the five classic segments keep the
+#     exact allowance they had before;
+#   * each row is truncated — a month digest runs 1000+ characters and four of
+#     those would drown the breath. The [id:...] prefix is the handle: read the
+#     full text with extmcp_get_memory.
+# [季记] and [半年记] are deliberately absent: they may still surface on their
+# own through TOP / search, they are just not part of the fixed strip.
+BREATH_CHRONICLE_ENABLED = os.environ.get(
+    "BREATH_CHRONICLE_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# Order here is the render order: fine grain first, coarse last.
+BREATH_CHRONICLE_PREFIXES: tuple[str, ...] = ("[日记] ", "[周记] ", "[月记] ", "[年记] ")
+BREATH_CHRONICLE_CATEGORY = os.environ.get("BREATH_CHRONICLE_CATEGORY", "digest")
+BREATH_CHRONICLE_SESSION = os.environ.get("BREATH_CHRONICLE_SESSION", "digest_rollup")
+# Own pot, added on top of BREATH_TOKEN_BUDGET rather than carved out of it.
+# 4 rows x ~415 chars worst case + header ≈ 1700; 1900 leaves headroom.
+BREATH_CHRONICLE_BUDGET = int(os.environ.get("BREATH_CHRONICLE_BUDGET", "1900"))
+# Per-row content cap. The unlimited (injector) path gets the roomier one — the
+# nudge context is read once per wakeup and can afford it — but is still capped,
+# because nudge_inject.py renders CHRONICLE uncollapsed on every single cycle.
+BREATH_CHRONICLE_ROW_CHARS = int(os.environ.get("BREATH_CHRONICLE_ROW_CHARS", "300"))
+BREATH_CHRONICLE_ROW_CHARS_FULL = int(
+    os.environ.get("BREATH_CHRONICLE_ROW_CHARS_FULL", "600")
+)
+# A fresh digest sits in tier='watch' for a week or two, which means the very row
+# CHRONICLE pins would also show up under WATCH — the same memory printed twice
+# in one breath. With this on, ids claimed by CHRONICLE are excluded from the
+# candidate SQL of the segments below it, so WATCH/TOP hand their slot to a
+# non-digest row instead of echoing. Turn it off to get the raw pre-2026-08-30
+# behaviour of those segments back.
+BREATH_CHRONICLE_DEDUPE = os.environ.get(
+    "BREATH_CHRONICLE_DEDUPE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _fetch_chronicle_recs(store: "MemoryStore", exclude_ids: set[str]) -> list:
+    """Newest digest at each chronicle level, in BREATH_CHRONICLE_PREFIXES order.
+
+    One query per level, LIMIT 1. A level with nothing in the store simply
+    contributes no row — the day/half-month/year layers were still being built
+    when this landed, and a missing layer must never raise.
+
+    Ordering is `key DESC` first, `created_at DESC` only as a tiebreak. Every
+    key format the rollup emits sorts lexically in period order ('2026-W34' >
+    '2026-W09', '2026-08' > '2026-07'), whereas created_at reflects when the
+    summary was *written*: a backfill run filling an old gap today would
+    otherwise make a February week look like the newest one.
+
+    No tier / resolved / digested filter on purpose. 「必出」means the newest
+    period wins even after a parent rollup has pushed it down to archive; the
+    strip is a calendar, not a work queue.
+
+    Matching is a half-open range on `key` rather than LIKE. Every prefix ends
+    in a space, so `key >= '[月记] ' AND key < '[月记]!'` selects exactly that
+    layer — '[半月记] …' starts with a different character and cannot be caught,
+    LIKE's `_` wildcard never gets a chance to misfire, and the comparison is a
+    plain BINARY range that idx_memories_key can seek on. (The LIKE form
+    measured as a full SCAN + temp b-tree on the 12k-row store.)
+
+    The rollup stamps both category='digest' and session_id='digest_rollup', so
+    either one identifies a real digest. The category is tried first and the
+    session is a fallback for the miss case: if a future layer ships with a
+    different category the strip still finds it, while a hand-written note
+    happening to start with '[日记] ' still cannot sneak in.
+    """
+    sql = (
+        "SELECT * FROM memories WHERE memory_kind='long_term' "
+        "AND key >= ? AND key < ? AND {} = ? "
+        "ORDER BY key DESC, created_at DESC LIMIT 1"
+    )
+    out: list = []
+    for prefix in BREATH_CHRONICLE_PREFIXES:
+        lo = prefix
+        hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        row = None
+        for column, value in (
+            ("category", BREATH_CHRONICLE_CATEGORY),
+            ("session_id", BREATH_CHRONICLE_SESSION),
+        ):
+            try:
+                with store._lock:
+                    row = store.conn.execute(
+                        sql.format(column), (lo, hi, value)
+                    ).fetchone()
+            except sqlite3.Error:
+                row = None
+            if row is not None:
+                break
+        if row is None:
+            continue
+        rec = store._row_to_record(row)
+        if rec.id in exclude_ids:
+            continue          # already on screen higher up (pinned); do not echo
+        out.append(rec)
+    return out
+
 
 def _compose_breath_output(
     store: "MemoryStore",
@@ -634,6 +738,10 @@ def _compose_breath_output(
         thing; the budget cap there used to swallow entire segments, leaving a
         header with no rows under it.
       * any positive value — that many characters, same semantics as before.
+
+    The CHRONICLE segment does not draw on `budget` at all; it has its own
+    BREATH_CHRONICLE_BUDGET pot and its own per-row truncation, so turning it
+    on cannot shrink what the five classic segments used to show.
     """
     effective_budget = BREATH_TOKEN_BUDGET if budget is None else budget
     unlimited = effective_budget <= 0
@@ -646,13 +754,31 @@ def _compose_breath_output(
         ).fetchall()
     pinned_recs = [store._row_to_record(r) for r in pinned_rows]
 
+    # 1.5) CHRONICLE — fixed digest strip, fetched by key prefix. Resolved
+    #      before the ranked segments so its ids can be kept out of their
+    #      candidate pools (see BREATH_CHRONICLE_DEDUPE).
+    chron_recs: list = []
+    if BREATH_CHRONICLE_ENABLED:
+        chron_recs = _fetch_chronicle_recs(store, {r.id for r in pinned_recs})
+    chron_ids = {r.id for r in chron_recs}
+    # Fragment + params spliced into the SQL of the segments below. Empty string
+    # when there is nothing to exclude, so the queries stay byte-identical to
+    # the pre-chronicle ones in that case.
+    if chron_ids and BREATH_CHRONICLE_DEDUPE:
+        _excl_sql = " AND id NOT IN ({})".format(",".join("?" * len(chron_ids)))
+        _excl_params: tuple = tuple(chron_ids)
+    else:
+        _excl_sql = ""
+        _excl_params = ()
+
     # 2) CORE tier — constitutional layer, deterministic day-of-year rotation.
     #    Read-only rotation (no DB writes) so the do_touch=False /breath-hook
     #    path rotates identically to the tool path.
     with store._lock:
         core_rows = store.conn.execute(
             "SELECT * FROM memories WHERE tier='core' AND resolved=0 AND digested=0 "
-            "AND pinned=0 AND memory_kind='long_term' ORDER BY id"
+            "AND pinned=0 AND memory_kind='long_term'" + _excl_sql + " ORDER BY id",
+            _excl_params,
         ).fetchall()
     core_all = [store._row_to_record(r) for r in core_rows]
     if len(core_all) > BREATH_CORE_QUOTA:
@@ -666,7 +792,9 @@ def _compose_breath_output(
     with store._lock:
         working_rows = store.conn.execute(
             "SELECT * FROM memories WHERE tier='working' AND resolved=0 AND digested=0 "
-            "AND pinned=0 AND memory_kind='long_term' ORDER BY updated_at DESC"
+            "AND pinned=0 AND memory_kind='long_term'" + _excl_sql
+            + " ORDER BY updated_at DESC",
+            _excl_params,
         ).fetchall()
     working_all = [store._row_to_record(r) for r in working_rows]
     working_total = len(working_all)
@@ -676,8 +804,9 @@ def _compose_breath_output(
     with store._lock:
         watch_rows = store.conn.execute(
             "SELECT * FROM memories WHERE tier='watch' AND resolved=0 AND digested=0 "
-            "AND pinned=0 AND memory_kind='long_term' ORDER BY updated_at DESC LIMIT ?",
-            (BREATH_WATCH_QUOTA,),
+            "AND pinned=0 AND memory_kind='long_term'" + _excl_sql
+            + " ORDER BY updated_at DESC LIMIT ?",
+            _excl_params + (BREATH_WATCH_QUOTA,),
         ).fetchall()
     watch_recs = [store._row_to_record(r) for r in watch_rows]
 
@@ -687,8 +816,9 @@ def _compose_breath_output(
     with store._lock:
         un_rows = store.conn.execute(
             "SELECT * FROM memories WHERE resolved=0 AND pinned=0 AND digested=0 "
-            "AND memory_kind='long_term' AND COALESCE(tier,'')='' "
-            "ORDER BY updated_at DESC LIMIT 200"
+            "AND memory_kind='long_term' AND COALESCE(tier,'')=''" + _excl_sql
+            + " ORDER BY updated_at DESC LIMIT 200",
+            _excl_params,
         ).fetchall()
     un_recs = [store._row_to_record(r) for r in un_rows]
     for rec in un_recs:
@@ -718,25 +848,36 @@ def _compose_breath_output(
         un_picked = un_pool[:un_quota]
 
     # 6) Format with token budget (rough: 1 char ≈ 1 token for CJK; whitespace flattened)
-    def _fmt(rec, weight_str: str) -> str:
+    def _fmt(rec, weight_str: str, body_cap: int = 0) -> str:
         # key flattened too: a newline inside it would split the row and orphan
         # the continuation from its [id:...] prefix (breaks per-line consumers).
         flat_key = " ".join((rec.key or "").split())
         flat = " ".join((rec.content or "").split())
+        if body_cap > 0 and len(flat) > body_cap:
+            # Marker names the id-bearing escape hatch explicitly: a reader who
+            # only ever sees the head of a month digest needs to know the rest
+            # exists and how to reach it.
+            flat = (
+                f"{flat[:body_cap]}…〔截断，全文 {len(flat)} 字，"
+                f"extmcp_get_memory 取全文〕"
+            )
         return (
             f"[id:{rec.id}] [weight:{weight_str} "
             f"V{rec.valence:.1f}/A{rec.arousal:.1f}] {flat_key}: {flat}"
         )
 
-    def _render(rec, weight_of, suffix_of) -> str:
-        line = _fmt(rec, weight_of(rec))
+    def _render(rec, weight_of, suffix_of, body_cap: int = 0) -> str:
+        line = _fmt(rec, weight_of(rec), body_cap)
         if suffix_of is not None:
             line += suffix_of(rec)
         return line
 
-    used = 0
     n_lines = 0
     referenced: list[str] = []
+    # Segment index of each entry in `referenced`, so the touch pass below can
+    # tell a CHRONICLE row (never touched) from an identical id that surfaced
+    # through a ranked segment (touched as usual).
+    referenced_seg: list[int] = []
 
     def _decay_w(rec) -> str:
         if rec.decay_score <= 0.0:
@@ -751,17 +892,32 @@ def _compose_breath_output(
     if working_total > BREATH_WORKING_QUOTA:
         working_header = f"\n=== WORKING ({len(working_recs)}/{working_total}) ==="
 
+    # Header stays ASCII up to the parenthesis on purpose: nudge_inject.py
+    # derives a segment name with `split("(")[0].strip().split(" ")[0].upper()`,
+    # so this reads as "CHRONICLE" there and can be pinned open by name.
+    chron_row_cap = (
+        BREATH_CHRONICLE_ROW_CHARS_FULL if unlimited else BREATH_CHRONICLE_ROW_CHARS
+    )
+
     segments = [
-        ("=== PINNED ===", pinned_recs, lambda r: "999.00", None),
-        ("\n=== CORE ===", core_recs, _decay_w, None),
-        (working_header, working_recs, _decay_w, None),
-        ("\n=== WATCH ===", watch_recs, _decay_w, _watch_suffix),
-        ("\n=== TOP UNRESOLVED (by decay) ===", un_picked, _decay_w, None),
+        ("=== PINNED ===", pinned_recs, lambda r: "999.00", None, 0),
+        ("\n=== CHRONICLE (编年) ===", chron_recs, _decay_w, None, chron_row_cap),
+        ("\n=== CORE ===", core_recs, _decay_w, None, 0),
+        (working_header, working_recs, _decay_w, None, 0),
+        ("\n=== WATCH ===", watch_recs, _decay_w, _watch_suffix, 0),
+        ("\n=== TOP UNRESOLVED (by decay) ===", un_picked, _decay_w, None, 0),
     ]
+    CHRON_SEG = 1
     rendered = [
-        [_render(rec, weight_of, suffix_of) for rec in recs]
-        for (_h, recs, weight_of, suffix_of) in segments
+        [_render(rec, weight_of, suffix_of, body_cap) for rec in recs]
+        for (_h, recs, weight_of, suffix_of, body_cap) in segments
     ]
+
+    # Two independent character pots: index 0 is the five classic segments and
+    # keeps `effective_budget` untouched; index 1 is CHRONICLE's own allowance.
+    # <= 0 means unlimited, matching the module's existing budget convention.
+    pots = [0, 0]
+    caps = [effective_budget, 0 if unlimited else BREATH_CHRONICLE_BUDGET]
 
     rows_out: list[list[tuple[int, str]]] = [[] for _ in segments]
     header_charged = [False] * len(segments)
@@ -774,24 +930,28 @@ def _compose_breath_output(
         header — a headerless tier reads as truncated, whereas an empty-headed
         one reads as "that tier has nothing in it", which was the 2026-08-08 bug.
 
-        `used` tracks the length of the final "\\n".join(...), separators
+        `pots[p]` tracks the length of the final "\\n".join(...), separators
         included: every element after the first costs one extra character.
         Charging only the raw text overruns the cap once the budget is actually
         spent to the last row, which the old single-pass version never was.
+        CHRONICLE bills its own pot, so it neither starves nor is starved by the
+        ranked segments.
         """
-        nonlocal used, n_lines
+        nonlocal n_lines
+        p = 1 if i == CHRON_SEG else 0
         add = []
         if not header_charged[i]:
             add.append(segments[i][0])
         add.append(rendered[i][j])
         cost = sum(len(e) for e in add) + (len(add) if n_lines else len(add) - 1)
-        if not unlimited and used + cost > effective_budget:
+        if caps[p] > 0 and pots[p] + cost > caps[p]:
             return False
         header_charged[i] = True
         rows_out[i].append((j, rendered[i][j]))
-        used += cost
+        pots[p] += cost
         n_lines += len(add)
         referenced.append(segments[i][1][j].id)
+        referenced_seg.append(i)
         return True
 
     # Pass 1 — seed every non-empty segment with one row, in segment order.
@@ -827,12 +987,25 @@ def _compose_breath_output(
 
     text = "\n".join(lines)
 
-    # 6) Discounted touch with cooldown
-    if do_touch and referenced:
+    # 6) Discounted touch with cooldown.
+    #    CHRONICLE rows are exempt: the strip is on screen unconditionally, so
+    #    crediting it with activation would let a digest inflate its own decay
+    #    score forever and eventually crowd TOP UNRESOLVED with its own echo.
+    #    An id that ALSO surfaced through a ranked segment (only possible with
+    #    BREATH_CHRONICLE_DEDUPE off) is still touched, on that segment's behalf.
+    touch_ids: list[str] = []
+    _seen_touch: set[str] = set()
+    for mid, seg_i in zip(referenced, referenced_seg):
+        if seg_i == CHRON_SEG or mid in _seen_touch:
+            continue
+        _seen_touch.add(mid)
+        touch_ids.append(mid)
+
+    if do_touch and touch_ids:
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(hours=cooldown_hours)).isoformat()
         with store._lock:
-            for mid in referenced:
+            for mid in touch_ids:
                 row = store.conn.execute(
                     "SELECT last_breath_at FROM memories WHERE id=?", (mid,)
                 ).fetchone()
@@ -3218,6 +3391,10 @@ TOOLS = [
             "**不要**用它来精确查找特定的历史事件（那种场景请用 extmcp_search_memory）。"
             "被浮现的每条记忆会按 0.3 折扣激活（activation_count += 0.3），"
             "且 6 小时内同一条不会重复激活，避免回音壁效应。"
+            "输出里的 === CHRONICLE (编年) === 段是固定的分层总结带，"
+            "每次都端出最新的一条日记 / 周记 / 月记 / 年记（缺哪级就少哪行），"
+            "内容按行截断，要全文用 extmcp_get_memory 按行首 id 取；"
+            "这一段不参与激活，也不占用其余五段的篇幅预算。"
         ),
         "inputSchema": {
             "type": "object",
@@ -3796,10 +3973,17 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         )}]
 
     elif name == "extmcp_dream":
+        # category='digest' excluded (2026-08-30): the rollup summaries are
+        # already surfaced unconditionally by breath's CHRONICLE strip, and they
+        # are re-written in batches, so they would otherwise flood the
+        # "10 most recently updated" window and drown the raw memories dream
+        # exists to look at. They stay reachable through search / get_memory.
         with store._lock:
             rows = store.conn.execute(
                 "SELECT * FROM memories WHERE memory_kind='long_term' AND pinned=0 AND digested=0 "
-                "ORDER BY updated_at DESC LIMIT 10"
+                "AND COALESCE(category,'') <> ? "
+                "ORDER BY updated_at DESC LIMIT 10",
+                (BREATH_CHRONICLE_CATEGORY,),
             ).fetchall()
         recs = [store._row_to_record(r) for r in rows]
         if not recs:
@@ -3815,7 +3999,9 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             emb_rows = store.conn.execute(
                 "SELECT id, embedding FROM memories "
                 "WHERE memory_kind='long_term' AND pinned=0 AND digested=0 AND length(embedding)>0 "
-                "ORDER BY updated_at DESC LIMIT 10"
+                "AND COALESCE(category,'') <> ? "
+                "ORDER BY updated_at DESC LIMIT 10",
+                (BREATH_CHRONICLE_CATEGORY,),
             ).fetchall()
         emb_map: dict[str, list] = {r["id"]: _unpack_embedding(r["embedding"]) for r in emb_rows}
 

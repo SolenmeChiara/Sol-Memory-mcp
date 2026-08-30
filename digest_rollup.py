@@ -1,4 +1,4 @@
-"""Layered recursive digests over the memory store (week → month → quarter → half-year).
+"""Layered recursive digests over the memory store (day → … → year).
 
 Adds a lossless "summary layer" on top of the raw fragments: every finished
 natural period gets one extra memory row that narrates it. Source fragments are
@@ -7,25 +7,52 @@ difference from consolidate_sessions.py, which merges lossily and marks its
 sources digested=1 (and those sources get hard-deleted after DIGESTED_PRUNE_DAYS).
 
 Layers and keys:
-    [周记] 2026-W35     ISO week  (Monday-start, America/Toronto local time)
+    [日记] 2026-08-29    local calendar day
+    [周记] 2026-W35      ISO week (Monday-start, America/Toronto local time)
+    [半月记] 2026-08上   1st–15th; 下 = 16th–end of month
     [月记] 2026-08
     [季记] 2026-Q3
     [半年记] 2026-H2
+    [年记] 2026
 
-Cascade with anti-telephone-game mixing: a month digest reads that month's week
-digests *plus* the month's top-importance raw entries, so drift introduced by one
-summarisation round gets corrected against the originals. Same for quarter/half.
+Two separate relationships run between the layers, and they deliberately do not
+line up:
 
-Absorb = archive: once a month digest is written, that month's week digests are
-moved to tier='archive' (searchable, no longer surfacing in breath). Quarters
-absorb months, halves absorb quarters. Raw fragments are never re-tiered.
+  * INPUT_CHILD — who reads whom. half-month reads days, month reads weeks,
+    quarter reads months, half reads quarters, year reads halves. Weeks read raw
+    fragments only, and months keep reading weeks rather than half-months: a
+    week straddles the 15th/16th boundary, so feeding half-months into the month
+    layer would double-count the straddling days and produce cross-boundary
+    nonsense. Half-months hang off the day layer as their own short branch.
+  * ABSORB_CHILD — who archives whom once written. Same pairs, plus week→day
+    (a week archives its 7 day digests even though it does not read them), minus
+    half-month (which absorbs nothing and simply ages out of watch on its own).
+
+Anti-telephone-game mixing: a parent digest reads its children's full text *plus*
+that period's top-importance raw entries, so drift introduced by one summarisation
+round gets corrected against the originals.
+
+Absorb = archive: tier='archive' (searchable, no longer surfacing in breath),
+tier_until cleared. Raw fragments are never re-tiered.
 
 Usage:
     python digest_rollup.py --dry-run              # what would be generated
-    python digest_rollup.py                        # generate (max 4 per layer)
-    python digest_rollup.py --backfill-all         # no per-layer cap
+    python digest_rollup.py                        # daily run: yesterday's 日记 + whatever else came due
+    python digest_rollup.py --backfill-all         # no per-layer cap (day/year still windowed, see below)
     python digest_rollup.py --since 2026-06-01     # ignore anything older
     python digest_rollup.py --force --since 2026-08-01   # rewrite existing keys
+
+Three layers carry their own enumeration window on top of --backfill, because
+"every finished period since the store began" is the wrong default for them:
+
+    day        only the last --day-lookback days (default 3). NOT lifted by
+               --backfill-all — backfilling a year of days is hundreds of LLM
+               calls for material the week digests already cover. Raise
+               --day-lookback deliberately if you really want older ones.
+    halfmonth  only the last --halfmonth-recent finished periods (default 1);
+               --backfill-all lifts this and walks the whole history.
+    year       only years >= --year-min (default 2026): 2025 is a partial year in
+               this store, and 2026 will generate itself on 2027-01-01.
 
 Safe to re-run: existing keys are skipped unless --force. Periods still in
 progress are never generated. A period whose LLM call fails is left missing and
@@ -68,21 +95,47 @@ LLM_TIMEOUT = 600.0          # seconds per claude call
 LLM_ATTEMPTS = 2             # initial call + one retry
 
 # Layer configuration. `cn` doubles as the key prefix: "[周记] ".
-LAYERS = ("week", "month", "quarter", "half")
+# `unit` fills "这一{unit}" / "一{unit}"; `ref` fills the "本X" possessive slots
+# ("本周的周记") — kept separate because "本天" is not Chinese.
+# LAYERS is also the *execution order*: every layer must come after everything it
+# reads and everything it archives.
+LAYERS = ("day", "week", "halfmonth", "month", "quarter", "half", "year")
 LAYER_CFG = {
-    "week":    {"cn": "周记",   "unit": "周",   "importance": 0.55, "max_chars": 600,  "model": "haiku",  "watch_days": 8},
-    "month":   {"cn": "月记",   "unit": "月",   "importance": 0.65, "max_chars": 800,  "model": "sonnet", "watch_days": 12},
-    "quarter": {"cn": "季记",   "unit": "季度", "importance": 0.75, "max_chars": 1000, "model": "opus",   "watch_days": 16},
-    "half":    {"cn": "半年记", "unit": "半年", "importance": 0.85, "max_chars": 1200, "model": "opus",   "watch_days": 20},
+    "day":       {"cn": "日记",   "unit": "天",   "ref": "这一天", "importance": 0.45, "max_chars": 400,  "model": "haiku",  "watch_days": 2},
+    "week":      {"cn": "周记",   "unit": "周",   "ref": "本周",   "importance": 0.55, "max_chars": 600,  "model": "haiku",  "watch_days": 8},
+    "halfmonth": {"cn": "半月记", "unit": "半月", "ref": "本半月", "importance": 0.60, "max_chars": 700,  "model": "sonnet", "watch_days": 10},
+    "month":     {"cn": "月记",   "unit": "月",   "ref": "本月",   "importance": 0.65, "max_chars": 800,  "model": "sonnet", "watch_days": 12},
+    "quarter":   {"cn": "季记",   "unit": "季度", "ref": "本季度", "importance": 0.75, "max_chars": 1000, "model": "opus",   "watch_days": 16},
+    "half":      {"cn": "半年记", "unit": "半年", "ref": "本半年", "importance": 0.85, "max_chars": 1200, "model": "opus",   "watch_days": 20},
+    "year":      {"cn": "年记",   "unit": "年",   "ref": "本年",   "importance": 0.95, "max_chars": 1500, "model": "opus",   "watch_days": 30},
 }
-# Which layer feeds which — quarter reads months, half reads quarters.
-CHILD_LAYER = {"month": "week", "quarter": "month", "half": "quarter"}
+# Which layer feeds which — quarter reads months, half reads quarters. Layers
+# absent as keys (day, week) read raw fragments only.
+INPUT_CHILD = {"halfmonth": "day", "month": "week", "quarter": "month",
+               "half": "quarter", "year": "half"}
+# Which layer archives which once written. Same as INPUT_CHILD except: week
+# archives the days it covers without reading them (the week is written from raw
+# fragments, but the day digests underneath it have served their purpose), and
+# halfmonth archives nothing — its own watch window expiring is its exit.
+ABSORB_CHILD = {"week": "day", "month": "week", "quarter": "month",
+                "half": "quarter", "year": "half"}
+# Layers that postpone themselves while a child digest is still missing. The
+# half-month is excluded on purpose: day digests are not backfilled, so an older
+# half-month would wait forever instead of falling back to raw fragments.
+WAIT_CHILDREN = frozenset({"month", "quarter", "half", "year"})
 
 DEFAULT_MIN_ITEMS = 5        # below this, skip the period instead of padding it
-DEFAULT_TOP_RAW = 10         # top-importance raw entries mixed into month+ layers
+DEFAULT_MIN_ITEMS_DAY = 3    # a quiet day is still worth one paragraph
+DEFAULT_TOP_RAW = 10         # top-importance raw entries mixed into parent layers
+DEFAULT_TOP_RAW_YEAR = 15    # a year gets a few more, it has only 2 children to mix against
 DEFAULT_BACKFILL = 4         # missing periods generated per layer per run
 DEFAULT_MAX_ENTRY_CHARS = 1200
 DEFAULT_MAX_INPUT_CHARS = 120000
+
+# Per-layer enumeration windows — see the module docstring for why each exists.
+DEFAULT_DAY_LOOKBACK = 3     # finished days considered per run (catches up a 2-day outage)
+DEFAULT_HALFMONTH_RECENT = 1 # finished half-months considered per run unless --backfill-all
+DEFAULT_YEAR_MIN = 2026      # 2025 is a partial year in this store
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +230,8 @@ class Period:
     def local_range_text(self, tz: tzinfo) -> str:
         a = self.start_utc.astimezone(tz).date()
         b = (self.end_utc - timedelta(seconds=1)).astimezone(tz).date()
+        if a == b:
+            return f"{a.isoformat()}，多伦多本地时间"
         return f"{a.isoformat()} 至 {b.isoformat()}，多伦多本地时间"
 
     def stamp_utc(self) -> str:
@@ -204,6 +259,13 @@ def _month_add(y: int, m: int, delta: int) -> tuple[int, int]:
     return idx // 12, idx % 12 + 1
 
 
+def day_period(d: date, tz: tzinfo) -> Period:
+    """Day = local midnight → next local midnight."""
+    return Period("day", d.isoformat(),
+                  _local_midnight(d, tz), _local_midnight(d + timedelta(days=1), tz),
+                  d)
+
+
 def week_period(monday: date, tz: tzinfo) -> Period:
     """Week = local Monday 00:00 → next Monday 00:00.
 
@@ -220,6 +282,21 @@ def week_period(monday: date, tz: tzinfo) -> Period:
         _local_midnight(monday, tz), _local_midnight(monday + timedelta(days=7), tz),
         thursday,
     )
+
+
+def halfmonth_period(y: int, m: int, h: int, tz: tzinfo) -> Period:
+    """Half-month: h=1 is the 1st–15th, h=2 is the 16th to the end of the month.
+
+    Split on a fixed day-of-month rather than on the midpoint so the label stays
+    predictable: 上 is always 15 days, 下 is 13/14/15/16 depending on the month.
+    """
+    if h == 1:
+        start, end = date(y, m, 1), date(y, m, 16)
+    else:
+        ny, nm = _month_add(y, m, 1)
+        start, end = date(y, m, 16), date(ny, nm, 1)
+    return Period("halfmonth", f"{y}-{m:02d}{'上' if h == 1 else '下'}",
+                  _local_midnight(start, tz), _local_midnight(end, tz), start)
 
 
 def month_period(y: int, m: int, tz: tzinfo) -> Period:
@@ -245,78 +322,78 @@ def half_period(y: int, h: int, tz: tzinfo) -> Period:
                   date(y, start_m, 1))
 
 
-def enumerate_periods(layer: str, since_local: date, now_utc: datetime, tz: tzinfo) -> list[Period]:
-    """All *finished* periods of *layer* that start on/after the week containing
-    since_local. A period counts as finished once its end instant has passed."""
-    out: list[Period] = []
+def year_period(y: int, tz: tzinfo) -> Period:
+    return Period("year", f"{y}",
+                  _local_midnight(date(y, 1, 1), tz), _local_midnight(date(y + 1, 1, 1), tz),
+                  date(y, 1, 1))
+
+
+def period_containing(layer: str, d: date, tz: tzinfo) -> Period:
+    """The period of *layer* that the local date *d* falls inside.
+
+    Single source of truth for "which bucket does this day belong to" — both the
+    enumeration walk and the parent→child mapping go through it, so a week can
+    never be enumerated one way and looked up another.
+    """
+    if layer == "day":
+        return day_period(d, tz)
     if layer == "week":
-        cur = since_local - timedelta(days=since_local.weekday())
-        while True:
-            p = week_period(cur, tz)
-            if p.end_utc > now_utc:
-                break
-            out.append(p)
-            cur += timedelta(days=7)
-        return out
-
+        return week_period(d - timedelta(days=d.weekday()), tz)
+    if layer == "halfmonth":
+        return halfmonth_period(d.year, d.month, 1 if d.day <= 15 else 2, tz)
     if layer == "month":
-        y, m = since_local.year, since_local.month
-        while True:
-            p = month_period(y, m, tz)
-            if p.end_utc > now_utc:
-                break
-            out.append(p)
-            y, m = _month_add(y, m, 1)
-        return out
-
+        return month_period(d.year, d.month, tz)
     if layer == "quarter":
-        y, q = since_local.year, (since_local.month - 1) // 3 + 1
-        while True:
-            p = quarter_period(y, q, tz)
-            if p.end_utc > now_utc:
-                break
-            out.append(p)
-            q += 1
-            if q > 4:
-                q, y = 1, y + 1
-        return out
-
+        return quarter_period(d.year, (d.month - 1) // 3 + 1, tz)
     if layer == "half":
-        y, h = since_local.year, 1 if since_local.month <= 6 else 2
-        while True:
-            p = half_period(y, h, tz)
-            if p.end_utc > now_utc:
-                break
-            out.append(p)
-            h += 1
-            if h > 2:
-                h, y = 1, y + 1
-        return out
-
+        return half_period(d.year, 1 if d.month <= 6 else 2, tz)
+    if layer == "year":
+        return year_period(d.year, tz)
     raise ValueError(f"unknown layer: {layer}")
 
 
-def child_periods(period: Period, tz: tzinfo) -> list[Period]:
-    """The sub-periods a month/quarter/half absorbs, in chronological order."""
-    if period.layer == "month":
-        y, m = int(period.label[:4]), int(period.label[5:7])
-        # Sweep every Monday that could put its Thursday inside this month.
-        first, last = date(y, m, 1), date(*_month_add(y, m, 1), 1) - timedelta(days=1)
-        cur = first - timedelta(days=first.weekday() + 7)
-        out = []
-        while cur <= last + timedelta(days=7):
-            wp = week_period(cur, tz)
-            if wp.anchor.year == y and wp.anchor.month == m:
-                out.append(wp)
-            cur += timedelta(days=7)
-        return out
-    if period.layer == "quarter":
-        y, q = int(period.label[:4]), int(period.label[6])
-        return [month_period(y, (q - 1) * 3 + i, tz) for i in (1, 2, 3)]
-    if period.layer == "half":
-        y, h = int(period.label[:4]), int(period.label[6])
-        return [quarter_period(y, (h - 1) * 2 + i, tz) for i in (1, 2)]
-    return []
+def next_period(period: Period, tz: tzinfo) -> Period:
+    """The period immediately after *period*.
+
+    period.end_utc is, by construction, local midnight of the first day of the
+    next period — so converting it back to a local date and re-bucketing lands
+    exactly one period forward, for every layer, without per-layer arithmetic.
+    """
+    return period_containing(period.layer, period.end_utc.astimezone(tz).date(), tz)
+
+
+def enumerate_periods(layer: str, since_local: date, now_utc: datetime, tz: tzinfo) -> list[Period]:
+    """All *finished* periods of *layer* from the one containing since_local
+    onwards. A period counts as finished once its end instant has passed."""
+    out: list[Period] = []
+    p = period_containing(layer, since_local, tz)
+    while p.end_utc <= now_utc:
+        out.append(p)
+        p = next_period(p, tz)
+    return out
+
+
+def sub_periods(period: Period, child_layer: str, tz: tzinfo) -> list[Period]:
+    """The *child_layer* periods filed under *period*, chronologically.
+
+    Membership is decided by the child's anchor, not by overlap. For a week the
+    anchor is its Thursday, which is the ISO rule for a week straddling a month
+    boundary (the week belongs to whichever month holds the majority of its days,
+    and the Thursday marks that majority). Every other layer anchors on its own
+    first day, so nothing straddles: days, months, quarters and halves nest
+    exactly inside their parents.
+    """
+    first_local = period.start_utc.astimezone(tz).date()
+    last_local = (period.end_utc - timedelta(seconds=1)).astimezone(tz).date()
+    # Start a week early so a week whose Thursday lands in this period but whose
+    # Monday sits in the previous one still gets considered.
+    p = period_containing(child_layer, first_local - timedelta(days=7), tz)
+    out: list[Period] = []
+    while p.anchor <= last_local + timedelta(days=7):
+        if first_local <= p.anchor <= last_local:
+            out.append(p)
+        p = next_period(p, tz)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +648,7 @@ def _digest_block(items: list[dict]) -> str:
 def build_prompt(period: Period, tz: tzinfo, *, raw_items: list[dict], digest_items: list[dict],
                  dropped: int, entry_limit: int) -> str:
     cfg = LAYER_CFG[period.layer]
-    cn, unit, max_chars = cfg["cn"], cfg["unit"], cfg["max_chars"]
+    cn, unit, ref, max_chars = cfg["cn"], cfg["unit"], cfg["ref"], cfg["max_chars"]
 
     header = (
         f"你是一名记忆整理员。下面是 {period.key}（{period.local_range_text(tz)}）"
@@ -587,8 +664,9 @@ def build_prompt(period: Period, tz: tzinfo, *, raw_items: list[dict], digest_it
         f"6. 全文中文，使用全角标点，引号一律用「」，总长度不超过 {max_chars} 字。\n\n"
         f"### 输出结构（三段，段间空一行，不加小标题）\n"
     )
-    if period.layer == "week":
-        header += "第一段：主线叙事。开头第一句先用一句话概括这一周的基调，然后按时间顺序展开这一周实际发生的事。\n"
+    if period.layer in ("day", "week"):
+        header += (f"第一段：主线叙事。开头第一句先用一句话概括这一{unit}的基调，"
+                   f"然后按时间顺序展开这一{unit}实际发生的事。\n")
     else:
         header += f"第一段：主线叙事。开头第一句先用一句话概括这一{unit}的整体走向，然后展开主要脉络与转折。\n"
     header += (
@@ -598,19 +676,19 @@ def build_prompt(period: Period, tz: tzinfo, *, raw_items: list[dict], digest_it
 
     parts = [header]
     if digest_items:
-        child_cn = LAYER_CFG[CHILD_LAYER[period.layer]]["cn"]
-        parts.append(f"### 一、本{unit}的{child_cn}（{len(digest_items)} 篇，已是二手总结）\n\n{_digest_block(digest_items)}\n\n")
+        child_cn = LAYER_CFG[INPUT_CHILD[period.layer]]["cn"]
+        parts.append(f"### 一、{ref}的{child_cn}（{len(digest_items)} 篇，已是二手总结）\n\n{_digest_block(digest_items)}\n\n")
         parts.append(
-            f"### 二、本{unit}最重要的原始记忆（按 importance 取前 {len(raw_items)} 条，"
+            f"### 二、{ref}最重要的原始记忆（按 importance 取前 {len(raw_items)} 条，"
             f"用来校正上面二手总结里的失真）\n\n{_raw_block(raw_items, tz, entry_limit)}\n"
         )
     else:
         note = ""
-        if period.layer != "week":
-            note = f"（本{unit}没有可用的下层总结，直接依据原始记忆书写）"
+        if period.layer not in ("day", "week"):
+            note = f"（{ref}没有可用的下层总结，直接依据原始记忆书写）"
         parts.append(f"### 原始记忆（{len(raw_items)} 条，按时间升序）{note}\n\n{_raw_block(raw_items, tz, entry_limit)}\n")
     if dropped:
-        parts.append(f"\n注：本{unit}另有 {dropped} 条 importance 较低的记忆因篇幅所限未纳入，"
+        parts.append(f"\n注：{ref}另有 {dropped} 条 importance 较低的记忆因篇幅所限未纳入，"
                      f"总结时不必宣称已覆盖全部内容。\n")
     # Restating the limit after the material measurably helps — by the time the
     # model reaches the end of a 70k-character prompt the header has faded.
@@ -735,6 +813,17 @@ class Deferred(Exception):
     cheap, also does not consume the backfill budget."""
 
 
+def layer_min_items(layer: str, args) -> int:
+    """The --min-items threshold for one layer. Days get their own, lower one:
+    a day with 4 fragments is a perfectly ordinary day, while a week with 4 is
+    a week barely worth narrating."""
+    return args.min_items_day if layer == "day" else args.min_items
+
+
+def layer_top_raw(layer: str, args) -> int:
+    return args.top_raw_year if layer == "year" else args.top_raw
+
+
 def unsettled_children(conn: sqlite3.Connection, period: Period, tz: tzinfo, args) -> list[str]:
     """Child periods that ought to have a digest but do not have one yet.
 
@@ -742,15 +831,19 @@ def unsettled_children(conn: sqlite3.Connection, period: Period, tz: tzinfo, arg
     week digests (the weeks having been capped away earlier in the same run),
     write it, and then never revisit it — idempotency would lock the bad version
     in and the quarter above would inherit it. A child counts as settled when it
-    already has a digest, or when its own raw count is below --min-items so it
-    would be skipped anyway and no digest will ever appear.
+    already has a digest, or when its own raw count is below that child layer's
+    --min-items so it would be skipped anyway and no digest will ever appear.
     """
+    child_layer = INPUT_CHILD.get(period.layer)
+    if not child_layer:
+        return []
     exclude = tuple(args.exclude_tier or ())
+    threshold = layer_min_items(child_layer, args)
     missing = []
-    for child in child_periods(period, tz):
+    for child in sub_periods(period, child_layer, tz):
         if existing_digest_id(conn, child.key):
             continue
-        if raw_count(conn, child, exclude) < args.min_items:
+        if raw_count(conn, child, exclude) < threshold:
             continue          # that child will never be generated — not a blocker
         missing.append(child.key)
     return missing
@@ -759,27 +852,52 @@ def unsettled_children(conn: sqlite3.Connection, period: Period, tz: tzinfo, arg
 def gather_inputs(conn: sqlite3.Connection, period: Period, tz: tzinfo, args) -> dict:
     """Collect this period's material. Raises Skipped/Deferred when unusable."""
     exclude = tuple(args.exclude_tier or ())
-    if period.layer == "week":
+    child_layer = INPUT_CHILD.get(period.layer)
+    min_items = layer_min_items(period.layer, args)
+    if not child_layer:
+        # day and week: the whole period's fragments, chronologically.
         raw = fetch_raw(conn, period, order="created_at", exclude_tiers=exclude)
         digests: list[dict] = []
     else:
-        if not args.no_wait_children:
+        if period.layer in WAIT_CHILDREN and not args.no_wait_children:
             missing = unsettled_children(conn, period, tz, args)
             if missing:
                 raise Deferred(f"下层还缺 {len(missing)} 篇（{', '.join(missing[:4])}"
                                f"{'…' if len(missing) > 4 else ''}），等下层补齐后再生成"
                                f"（--no-wait-children 可强行生成）")
-        digests = fetch_digests(conn, [c.key for c in child_periods(period, tz)])
-        raw = fetch_raw(conn, period, order="importance", limit=args.top_raw, exclude_tiers=exclude)
+        # A half-month simply takes whatever day digests happen to exist — usually
+        # none for a backfilled period, in which case it is written from raw
+        # fragments alone, same as any parent whose children were all skipped.
+        digests = fetch_digests(conn, [c.key for c in sub_periods(period, child_layer, tz)])
+        raw = fetch_raw(conn, period, order="importance", limit=layer_top_raw(period.layer, args),
+                        exclude_tiers=exclude)
         raw.sort(key=lambda r: r["created_at"])
 
     n_items = len(raw) + len(digests)
-    if n_items < args.min_items:
+    if n_items < min_items:
         raise Skipped(f"输入仅 {n_items} 条（下层总结 {len(digests)} + 原始 {len(raw)}），"
-                      f"少于 --min-items {args.min_items}")
+                      f"少于门槛 {min_items}")
 
     kept, dropped = trim_to_budget(raw, args.max_input_chars, args.max_entry_chars)
     return {"raw": kept, "digests": digests, "dropped": dropped, "n_items": n_items}
+
+
+def absorbed_digest_ids(conn: sqlite3.Connection, period: Period, tz: tzinfo,
+                        digests: list[dict]) -> list[str]:
+    """Digest rows this period archives on write.
+
+    Usually exactly the children it just read, so no second query. The week is
+    the exception: it is written from raw fragments but still retires the day
+    digests underneath it, so those have to be looked up separately. Layers
+    absent from ABSORB_CHILD (day, halfmonth) archive nothing.
+    """
+    child_layer = ABSORB_CHILD.get(period.layer)
+    if not child_layer:
+        return []
+    if child_layer == INPUT_CHILD.get(period.layer):
+        return [d["id"] for d in digests]
+    rows = fetch_digests(conn, [c.key for c in sub_periods(period, child_layer, tz)])
+    return [r["id"] for r in rows]
 
 
 def process_period(conn: sqlite3.Connection, period: Period, tz: tzinfo, args, models: dict) -> dict:
@@ -807,7 +925,7 @@ def process_period(conn: sqlite3.Connection, period: Period, tz: tzinfo, args, m
     src_ids = [d["id"] for d in digests] + [r["id"] for r in raw]
     content = body.rstrip() + source_line(src_ids)
     valence, arousal = period_emotion(conn, period)
-    absorb = [d["id"] for d in digests]      # only our own sub-digests, never raw fragments
+    absorb = absorbed_digest_ids(conn, period, tz, digests)  # our own sub-digests only, never raw fragments
     mem_id = write_digest(conn, period, content, category=args.category,
                           valence=valence, arousal=arousal,
                           absorb_ids=absorb, existing_id=existing)
@@ -819,6 +937,34 @@ def process_period(conn: sqlite3.Connection, period: Period, tz: tzinfo, args, m
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def layer_window(layer: str, periods: list[Period], now_utc: datetime, tz: tzinfo,
+                 args) -> tuple[list[Period], str]:
+    """Narrow a layer's enumerated periods to the ones it is allowed to generate,
+    and return a human note explaining the cut.
+
+    --backfill caps how many are *generated* per run but always takes the oldest
+    pending ones first, which is right for a fully backfilled layer (the oldest
+    missing one is the newest period) and badly wrong for the three layers whose
+    history is deliberately empty: with no window, day would spend every run
+    generating three days from early 2025 forever. See the module docstring.
+    """
+    if layer == "day":
+        floor = now_utc.astimezone(tz).date() - timedelta(days=max(1, args.day_lookback))
+        kept = [p for p in periods if p.anchor >= floor]
+        return kept, f"（只看 {floor.isoformat()} 起的最近 {max(1, args.day_lookback)} 天）"
+    if layer == "halfmonth" and not args.backfill_all:
+        n = max(1, args.halfmonth_recent)
+        if len(periods) > n:
+            return periods[-n:], f"（只看最近 {n} 个，--backfill-all 可全补）"
+        return periods, ""
+    if layer == "year":
+        kept = [p for p in periods if p.anchor.year >= args.year_min]
+        if len(kept) != len(periods):
+            return kept, f"（只生成 {args.year_min} 年及以后）"
+        return kept, ""
+    return periods, ""
+
 
 def parse_since(value: str, tz: tzinfo, conn: sqlite3.Connection) -> date:
     if value:
@@ -845,7 +991,7 @@ def main() -> int:
 
     here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(
-        description="分层递归总结：周 → 月 → 季 → 半年，原始碎片一律不动",
+        description="分层递归总结：日 → 周 → 半月 → 月 → 季 → 半年 → 年，原始碎片一律不动",
     )
     ap.add_argument("--db", default=str(here / "memory.db"), help="memory.db 路径（默认脚本同目录）")
     ap.add_argument("--dry-run", action="store_true",
@@ -856,24 +1002,39 @@ def main() -> int:
     ap.add_argument("--backfill", type=int, default=DEFAULT_BACKFILL,
                     help=f"每层每次最多回补的缺失周期数（默认 {DEFAULT_BACKFILL}）")
     ap.add_argument("--layers", default=",".join(LAYERS),
-                    help="只跑其中几层，逗号分隔（week,month,quarter,half）")
+                    help="只跑其中几层，逗号分隔（" + ",".join(LAYERS) + "）")
     ap.add_argument("--claude-cmd", default="claude", help="claude CLI 命令名或全路径")
     ap.add_argument("--llm-timeout", type=float, default=LLM_TIMEOUT,
                     help=f"单次 claude 调用超时秒数（默认 {LLM_TIMEOUT:.0f}；opus 层材料多时可调大）")
+    ap.add_argument("--model-day", default=LAYER_CFG["day"]["model"])
     ap.add_argument("--model-week", default=LAYER_CFG["week"]["model"])
+    ap.add_argument("--model-halfmonth", default=LAYER_CFG["halfmonth"]["model"])
     ap.add_argument("--model-month", default=LAYER_CFG["month"]["model"])
     ap.add_argument("--model-quarter", default=LAYER_CFG["quarter"]["model"])
     ap.add_argument("--model-half", default=LAYER_CFG["half"]["model"])
+    ap.add_argument("--model-year", default=LAYER_CFG["year"]["model"])
     ap.add_argument("--min-items", type=int, default=DEFAULT_MIN_ITEMS,
-                    help=f"当期输入少于该条数则跳过（默认 {DEFAULT_MIN_ITEMS}）")
+                    help=f"当期输入少于该条数则跳过（默认 {DEFAULT_MIN_ITEMS}，日记层除外）")
+    ap.add_argument("--min-items-day", type=int, default=DEFAULT_MIN_ITEMS_DAY,
+                    help=f"日记层的跳过门槛（默认 {DEFAULT_MIN_ITEMS_DAY}）")
     ap.add_argument("--top-raw", type=int, default=DEFAULT_TOP_RAW,
-                    help=f"月/季/半年额外混入的高 importance 原始条数（默认 {DEFAULT_TOP_RAW}）")
+                    help=f"半月/月/季/半年额外混入的高 importance 原始条数（默认 {DEFAULT_TOP_RAW}）")
+    ap.add_argument("--top-raw-year", type=int, default=DEFAULT_TOP_RAW_YEAR,
+                    help=f"年记额外混入的高 importance 原始条数（默认 {DEFAULT_TOP_RAW_YEAR}）")
+    ap.add_argument("--day-lookback", type=int, default=DEFAULT_DAY_LOOKBACK,
+                    help=f"日记层只看最近这么多天（默认 {DEFAULT_DAY_LOOKBACK}）。"
+                         f"--backfill-all 不会解除这个窗口，要补更早的日记必须显式调大")
+    ap.add_argument("--halfmonth-recent", type=int, default=DEFAULT_HALFMONTH_RECENT,
+                    help=f"半月记层只看最近这么多个已完结周期（默认 {DEFAULT_HALFMONTH_RECENT}），"
+                         f"--backfill-all 解除")
+    ap.add_argument("--year-min", type=int, default=DEFAULT_YEAR_MIN,
+                    help=f"年记层只生成这一年及以后（默认 {DEFAULT_YEAR_MIN}，更早的年份数据不全）")
     ap.add_argument("--max-entry-chars", type=int, default=DEFAULT_MAX_ENTRY_CHARS,
                     help=f"单条记忆送进 prompt 的字符上限（默认 {DEFAULT_MAX_ENTRY_CHARS}）")
     ap.add_argument("--max-input-chars", type=int, default=DEFAULT_MAX_INPUT_CHARS,
                     help=f"单次 prompt 材料区字符预算，超出按 importance 从低往高丢（默认 {DEFAULT_MAX_INPUT_CHARS}）")
     ap.add_argument("--no-wait-children", action="store_true",
-                    help="月/季/半年即使下层总结还没补齐也照常生成（默认等下层）")
+                    help="月/季/半年/年即使下层总结还没补齐也照常生成（默认等下层；半月记本就不等日记）")
     ap.add_argument("--exclude-tier", action="append", default=[],
                     help="排除某个 tier 的原始记忆（可重复，例如 --exclude-tier seabed）")
     ap.add_argument("--category", default="digest", help="新条目的 category（默认 digest）")
@@ -892,8 +1053,10 @@ def main() -> int:
         sys.stderr.write(f"[ERROR] 未知层级：{bad}，可选 {list(LAYERS)}\n")
         return 1
 
-    models = {"week": args.model_week, "month": args.model_month,
-              "quarter": args.model_quarter, "half": args.model_half}
+    models = {"day": args.model_day, "week": args.model_week,
+              "halfmonth": args.model_halfmonth, "month": args.model_month,
+              "quarter": args.model_quarter, "half": args.model_half,
+              "year": args.model_year}
 
     tz = load_tz(args.tz)
     now_utc = datetime.now(timezone.utc)
@@ -910,14 +1073,17 @@ def main() -> int:
             sys.stderr.write("--- DRY-RUN：不调 LLM，不写库 ---\n")
 
         totals = {"generated": 0, "skipped": 0, "deferred": 0, "failed": 0}
-        # Ordered week → month → quarter → half so a month can absorb the weeks
-        # this very run just produced.
+        # Walked in LAYERS order (day → week → halfmonth → month → quarter →
+        # half → year) so every layer sees the children this very run produced:
+        # the week can archive today's fresh day digests, the month can read the
+        # week it just wrote, and so on up.
         for layer in [x for x in LAYERS if x in layers]:
-            periods = enumerate_periods(layer, since_local, now_utc, tz)
+            periods, window_note = layer_window(
+                layer, enumerate_periods(layer, since_local, now_utc, tz), now_utc, tz, args)
             pending = [p for p in periods if args.force or not existing_digest_id(conn, p.key)]
             budget = 10 ** 9 if args.backfill_all else max(0, args.backfill)
             sys.stderr.write(
-                f"\n== {LAYER_CFG[layer]['cn']} == 已完结 {len(periods)} 个周期，"
+                f"\n== {LAYER_CFG[layer]['cn']} == 视野内已完结 {len(periods)} 个周期{window_note}，"
                 f"缺失 {len(pending)} 个，本次最多生成 {'不限' if args.backfill_all else budget} 个\n"
             )
             spent = 0
