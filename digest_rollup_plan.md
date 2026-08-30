@@ -69,3 +69,14 @@
 - 扩层后新增：周日（以及周六）的日记会在周记生成的同一轮里被立刻归档，2 天 watch 窗被削掉——规格里「周吃日归档日」与「日 watch 2 天」本身冲突，按规格保留归档语义，材料由进 watch 的周记继续覆盖，一周有 5 天能拿满 2 天曝光。
 - 日记层实测输出超标（要求 400 字，haiku 实出 600+），与周记同一个老毛病；且模型仍不完全服从「全角标点」。
 - 未提交 git：digest_rollup.py、digest_task.bat、本档案（回补验证后统一提交）。
+
+## 2026-08-30 七层扩层部署记录
+
+- 审查：独立 opus 审查 PASS_WITH_NOTES（键名契约咬合、两级 kill switch 逐字节还原 HEAD、周期数学 6158 断言全等、热路径 0.047ms/call；审查中修复 digest_task.bat CRLF 丢失）
+- 备份：memory-pre-digest7-20260830.db（11841 行，474MB，backup API）
+- 提交：Sol-Memory-mcp fb96c89 / nudge-agent 987bed8，均已 push
+- 部署：3456 重启（旧 8332 → 新实例）→ 计划任务 schtasks 改 DAILY 12:15 → rollup 首跑 → 注入器重启（旧 16120 → 16588，48765 锁单实例验证）
+- rollup 首跑：生成 9 篇 0 失败——3 日记（8/27-29）+ 4 周记 2025（W27/29/30/31，W28 空窗跳过）+ 1 半月记 2026-08上 + 1 月记 2025-07（同轮级联：吃掉刚生成的 4 篇周记并 absorb 归档，实战验证 absorb 链）。reindex_embeddings 补齐 10/10
+- 部署后验证：CHRONICLE 三行齐（日记 8/29 + 周记 W34 + 月记 2026-07，年记 2027 才有）；日记 tier 按周期锚精确落位（8/29、8/28 watch，8/27 过窗进普通层）；dream 抽样 0 digest；历史回补条目进普通层不占曝光
+- 遗留：注入器侧 CHRONICLE 进 context 的验证等下一轮唤醒；2025 历史周记还缺 ~33 篇，每日任务按 4 篇/日节奏自动补齐（约 8 天）；审查遗留意见（半月/季/半年记占 WATCH 槽、_row_to_record 裸调用）记录在 commit fb96c89 正文，未动手
+- 新工具：nudge-agent/restart_injector.sh——WSL 一条命令重启 Windows 注入器（注入器不可迁入 WSL：drvfs WAL + pc_status Windows API 两条硬依赖）
