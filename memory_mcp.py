@@ -44,6 +44,30 @@ from batch_import import (
 )
 
 
+def _load_dotenv(root: Path) -> None:
+    """Minimal .env loader shared with maintenance scripts. Populates os.environ
+    with KEY=VALUE pairs from <root>/.env if present. Existing env vars win."""
+    env_path = root / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+# Load the script-side .env *before* any module-level os.environ read below, so
+# tunables (BREATH_*, DECAY_*, EVENT_*, …) can live in .env. setdefault keeps
+# process env vars winning. main() still loads the db-side .env afterwards
+# (for keys read lazily at call time, e.g. OPENROUTER_API_KEY).
+try:
+    _load_dotenv(Path(__file__).resolve().parent)
+except Exception as _dotenv_exc:  # never let a bad .env stop the import
+    sys.stderr.write(f"[memory-mcp] .env early load skipped: {_dotenv_exc}\n")
+
+
 # ---------------------------------------------------------------------------
 # Ollama configuration (overridable via CLI args / env vars in main())
 # ---------------------------------------------------------------------------
@@ -67,6 +91,21 @@ IMPORT_CLOUD_TIMEOUT: float = float(os.environ.get("IMPORT_CLOUD_TIMEOUT", "180"
 
 DECAY_LAMBDA: float = float(os.environ.get("DECAY_LAMBDA", "0.05"))
 DECAY_THRESHOLD: float = float(os.environ.get("DECAY_THRESHOLD", "0.3"))
+
+# ---- Event down-weighting (consumed by _calc_decay_score in Task B) ----
+# category='event' & tier='' rows: full weight for EVENT_FRESH_DAYS after
+# created_at, then exp(-(age-fresh)/EVENT_HALF_DAYS), floored at EVENT_FLOOR.
+EVENT_FRESH_DAYS: float = float(os.environ.get("EVENT_FRESH_DAYS", "7"))
+EVENT_HALF_DAYS: float = float(os.environ.get("EVENT_HALF_DAYS", "10"))
+EVENT_FLOOR: float = float(os.environ.get("EVENT_FLOOR", "0.2"))
+
+# ---- next_due overdue grace (WORKING ordering / breath markers) ----
+# A WORKING row overdue by MORE than this many days (Toronto dates) loses its
+# next_due-first slot and falls back to plain updated_at order; its marker
+# flags it as probably done-but-not-closed.
+NEXT_DUE_OVERDUE_GRACE_DAYS: float = float(
+    os.environ.get("NEXT_DUE_OVERDUE_GRACE_DAYS", "7")
+)
 
 # ---- Retrieval quality tuning (env-overridable) ----
 SEARCH_ALPHA: float = float(os.environ.get("SEARCH_ALPHA", "0.4"))          # relative threshold: keep rel >= top * α
@@ -94,20 +133,6 @@ SCENT_ENABLED: bool = os.environ.get("SCENT_ENABLED", "1") != "0"
 SCENT_PROBABILITY: float = float(os.environ.get("SCENT_PROBABILITY", "0.35"))
 SCENT_BREATH_PROBABILITY: float = float(os.environ.get("SCENT_BREATH_PROBABILITY", "0.25"))
 SCENT_OLLAMA_TIMEOUT: float = float(os.environ.get("SCENT_OLLAMA_TIMEOUT", "10"))
-
-
-def _load_dotenv(root: Path) -> None:
-    """Minimal .env loader shared with maintenance scripts. Populates os.environ
-    with KEY=VALUE pairs from <root>/.env if present. Existing env vars win."""
-    env_path = root / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +606,31 @@ def _calc_decay_score(rec) -> float:
     else:
         factor = 1.0
     urgency = 1.5 if (arousal > 0.7 and not rec.resolved) else 1.0
-    return round(base * factor * urgency, 4)
+    return round(base * factor * urgency * _event_age_factor(rec), 4)
+
+
+def _event_age_factor(rec) -> float:
+    """Down-weight ordinary (tier='') event rows by age since created_at, not
+    last_active — surfacing refreshes last_active, so a busy event would never
+    age otherwise. Full weight for EVENT_FRESH_DAYS, then
+    exp(-(age - fresh) / EVENT_HALF_DAYS), floored at EVENT_FLOOR. Every other
+    row (other categories, any tier, pinned) gets 1.0."""
+    if (getattr(rec, "category", "") or "") != "event":
+        return 1.0
+    if (getattr(rec, "tier", "") or "") != "" or getattr(rec, "pinned", False):
+        return 1.0
+    created = (getattr(rec, "created_at", "") or "").replace("Z", "+00:00")
+    try:
+        created_dt = datetime.fromisoformat(created)
+    except (ValueError, TypeError):
+        return 1.0
+    if created_dt.tzinfo is None:
+        created_dt = created_dt.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - created_dt).total_seconds() / 86400
+    if age <= EVENT_FRESH_DAYS:
+        return 1.0
+    half = EVENT_HALF_DAYS if EVENT_HALF_DAYS > 0 else 1.0
+    return max(EVENT_FLOOR, math.exp(-(age - EVENT_FRESH_DAYS) / half))
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +648,38 @@ BREATH_PINNED_QUOTA = int(os.environ.get("BREATH_PINNED_QUOTA", "2"))
 # archive  传记历史层：已结案/沉淀，不主动浮现但可查
 # seabed   海床：批量导入的低价值碎片，永不主动浮现
 VALID_TIERS = frozenset({"", "working", "watch", "core", "archive", "seabed"})
+
+# ---- memory_relations (typed edges; see MemoryStore.add_relation) ----
+RELATION_TYPES = frozenset({"same_event", "supersedes"})
+RELATION_MAX_HOPS = 5
+# Ids that ranked breath segments should hide: non-main same_event members
+# (any same_event src) and superseded records (any supersedes dst). Constant,
+# parameter-free; splice as `AND id NOT IN (<this>)`. Pinned exemption is the
+# caller's job.
+RELATION_EXCLUDED_IDS_SQL = (
+    "SELECT src_id FROM memory_relations WHERE rel = 'same_event' "
+    "UNION SELECT dst_id FROM memory_relations WHERE rel = 'supersedes'"
+)
+
+
+def _parse_next_due(value: Any) -> str:
+    """Validate a next_due value. Accepts '' (clear), 'YYYY-MM-DD' or
+    'YYYY-MM-DDTHH:MM' — Toronto local time, no timezone suffix. Returns the
+    canonical string; raises ValueError on anything else."""
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return ""
+    for fmt, length in (("%Y-%m-%d", 10), ("%Y-%m-%dT%H:%M", 16)):
+        if len(s) != length:
+            continue
+        try:
+            return datetime.strptime(s, fmt).strftime(fmt)  # noqa: DTZ007 - format check only, value is Toronto-local by contract
+        except ValueError:
+            pass
+    raise ValueError(
+        f"invalid next_due: {s!r} (use '', YYYY-MM-DD or YYYY-MM-DDTHH:MM, "
+        "Toronto local time, no timezone suffix)"
+    )
 BREATH_CORE_QUOTA = int(os.environ.get("BREATH_CORE_QUOTA", "2"))
 BREATH_WORKING_QUOTA = int(os.environ.get("BREATH_WORKING_QUOTA", "5"))
 BREATH_WATCH_QUOTA = int(os.environ.get("BREATH_WATCH_QUOTA", "3"))
@@ -635,6 +716,16 @@ BREATH_CHRONICLE_BUDGET = int(os.environ.get("BREATH_CHRONICLE_BUDGET", "1900"))
 BREATH_CHRONICLE_ROW_CHARS = int(os.environ.get("BREATH_CHRONICLE_ROW_CHARS", "300"))
 BREATH_CHRONICLE_ROW_CHARS_FULL = int(
     os.environ.get("BREATH_CHRONICLE_ROW_CHARS_FULL", "600")
+)
+# WORKING per-row content cap. Working rows run 270-1900 chars; uncapped, the
+# first one ate the tool path's 3500-char pot and WORKING showed 1 of 5 rows.
+# Tool path (and CLI, which also runs on the budgeted pot) clips at 300 with
+# the same 〔截断…〕 marker CHRONICLE uses; the unlimited /breath-hook path
+# (nudge injector, renders WORKING uncollapsed) gets the _FULL value, where
+# 0 = no cap.
+BREATH_WORKING_ROW_CHARS = int(os.environ.get("BREATH_WORKING_ROW_CHARS", "300"))
+BREATH_WORKING_ROW_CHARS_FULL = int(
+    os.environ.get("BREATH_WORKING_ROW_CHARS_FULL", "0")
 )
 # A fresh digest sits in tier='watch' for a week or two, which means the very row
 # CHRONICLE pins would also show up under WATCH — the same memory printed twice
@@ -709,6 +800,49 @@ def _fetch_chronicle_recs(store: "MemoryStore", exclude_ids: set[str]) -> list:
     return out
 
 
+_TORONTO_TZ: Any = None
+
+
+def _toronto_today():
+    """Today's date in America/Toronto. Falls back to a fixed UTC-5 offset if
+    the tz database is missing (Windows without `tzdata`); at date granularity
+    that is off by at most one hour around midnight during DST."""
+    global _TORONTO_TZ
+    if _TORONTO_TZ is None:
+        try:
+            from zoneinfo import ZoneInfo
+            _TORONTO_TZ = ZoneInfo("America/Toronto")
+        except Exception as exc:  # noqa: BLE001 - any failure = no tz database
+            sys.stderr.write(
+                f"[memstore] zoneinfo America/Toronto unavailable ({exc!r}); "
+                "next_due markers use fixed UTC-5\n"
+            )
+            _TORONTO_TZ = timezone(timedelta(hours=-5))
+    return datetime.now(_TORONTO_TZ).date()
+
+
+def _next_due_suffix(next_due: str) -> str:
+    """Breath row suffix for a next_due value (Toronto-local 'YYYY-MM-DD' or
+    'YYYY-MM-DDTHH:MM'). Not yet due or due today → ' 〔到期 MM-DD[ HH:MM]〕';
+    due on an earlier Toronto date → ' 〔已过期 N 天〕'. '' / unparsable → ''."""
+    nd = (next_due or "").strip()
+    if len(nd) < 10:
+        return ""
+    try:
+        due = datetime.strptime(nd[:10], "%Y-%m-%d").date()  # noqa: DTZ007 - date only, Toronto-local by contract
+    except ValueError:
+        return ""
+    overdue_days = (_toronto_today() - due).days
+    if overdue_days > NEXT_DUE_OVERDUE_GRACE_DAYS:
+        return f" 〔已过期 {overdue_days} 天，疑似已完成未销账，请核对〕"
+    if overdue_days >= 1:
+        return f" 〔已过期 {overdue_days} 天〕"
+    label = nd[5:10]
+    if len(nd) >= 16 and nd[10] == "T":
+        label += " " + nd[11:16]
+    return f" 〔到期 {label}〕"
+
+
 def _compose_breath_output(
     store: "MemoryStore",
     *,
@@ -770,6 +904,14 @@ def _compose_breath_output(
     else:
         _excl_sql = ""
         _excl_params = ()
+    # Relation exclusion (plan §Q4): non-main same_event members and superseded
+    # rows stay out of CORE / WORKING / WATCH / TOP. Parameter-free subquery, so
+    # _excl_params is unchanged. Pinned rows are exempt (they are already
+    # pinned=0-filtered out of these segments; the clause keeps the contract
+    # explicit should that filter ever change).
+    _rel_sql, _rel_params = store.excluded_ids_sql()
+    _excl_sql += f" AND (pinned=1 OR id NOT IN ({_rel_sql}))"
+    _excl_params = _excl_params + tuple(_rel_params)
 
     # 2) CORE tier — constitutional layer, deterministic day-of-year rotation.
     #    Read-only rotation (no DB writes) so the do_touch=False /breath-hook
@@ -788,13 +930,23 @@ def _compose_breath_output(
     else:
         core_recs = core_all
 
-    # 3) WORKING tier — active working memory, most-recent first.
+    # 3) WORKING tier — rows with a next_due first (soonest / most overdue on
+    #    top), then undated rows most-recent first. A row overdue by more than
+    #    NEXT_DUE_OVERDUE_GRACE_DAYS counts as undated for ordering (stale due
+    #    dates must not squat the quota); its marker asks for a check instead.
+    _due_cutoff = (
+        _toronto_today() - timedelta(days=NEXT_DUE_OVERDUE_GRACE_DAYS)
+    ).isoformat()
+    _undated = (
+        "(COALESCE(next_due,'')='' OR substr(next_due,1,10) < ?)"
+    )
     with store._lock:
         working_rows = store.conn.execute(
             "SELECT * FROM memories WHERE tier='working' AND resolved=0 AND digested=0 "
             "AND pinned=0 AND memory_kind='long_term'" + _excl_sql
-            + " ORDER BY updated_at DESC",
-            _excl_params,
+            + f" ORDER BY CASE WHEN {_undated} THEN 1 ELSE 0 END, "
+            f"CASE WHEN {_undated} THEN '' ELSE next_due END ASC, updated_at DESC",
+            _excl_params + (_due_cutoff, _due_cutoff),
         ).fetchall()
     working_all = [store._row_to_record(r) for r in working_rows]
     working_total = len(working_all)
@@ -886,7 +1038,11 @@ def _compose_breath_output(
 
     def _watch_suffix(rec) -> str:
         tu = rec.tier_until or ""
-        return f" (watch until {tu[5:10]})" if len(tu) >= 10 else ""
+        base = f" (watch until {tu[5:10]})" if len(tu) >= 10 else ""
+        return base + _next_due_suffix(getattr(rec, "next_due", ""))
+
+    def _working_suffix(rec) -> str:
+        return _next_due_suffix(getattr(rec, "next_due", ""))
 
     working_header = "\n=== WORKING ==="
     if working_total > BREATH_WORKING_QUOTA:
@@ -898,12 +1054,15 @@ def _compose_breath_output(
     chron_row_cap = (
         BREATH_CHRONICLE_ROW_CHARS_FULL if unlimited else BREATH_CHRONICLE_ROW_CHARS
     )
+    working_row_cap = (
+        BREATH_WORKING_ROW_CHARS_FULL if unlimited else BREATH_WORKING_ROW_CHARS
+    )
 
     segments = [
         ("=== PINNED ===", pinned_recs, lambda r: "999.00", None, 0),
         ("\n=== CHRONICLE (编年) ===", chron_recs, _decay_w, None, chron_row_cap),
         ("\n=== CORE ===", core_recs, _decay_w, None, 0),
-        (working_header, working_recs, _decay_w, None, 0),
+        (working_header, working_recs, _decay_w, _working_suffix, working_row_cap),
         ("\n=== WATCH ===", watch_recs, _decay_w, _watch_suffix, 0),
         ("\n=== TOP UNRESOLVED (by decay) ===", un_picked, _decay_w, None, 0),
     ]
@@ -1611,6 +1770,7 @@ class MemoryRecord:
     last_active: str = ""
     tier: str = ""
     tier_until: str = ""
+    next_due: str = ""          # '' | YYYY-MM-DD | YYYY-MM-DDTHH:MM (Toronto local)
     final_score: float = 0.0
     vector_score: float = 0.0
     keyword_score: float = 0.0
@@ -1707,10 +1867,14 @@ class MemoryStore:
                 ("consolidated",     "INTEGER DEFAULT 0"),  # marks merge-products; excluded from future consolidate runs
                 ("tier",             "TEXT DEFAULT ''"),   # layered-memory tier (see VALID_TIERS)
                 ("tier_until",       "TEXT DEFAULT ''"),   # watch-tier expiry (UTC ISO); empty = no expiry
+                ("next_due",         "TEXT DEFAULT ''"),   # '' | YYYY-MM-DD | YYYY-MM-DDTHH:MM, Toronto local
             ]
             for col_name, col_def in _NEW_COLS:
                 if col_name not in columns:
                     self.conn.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
+                    sys.stderr.write(
+                        f"[memstore] migration: added column memories.{col_name}\n"
+                    )
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS phone_status (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1811,6 +1975,48 @@ class MemoryStore:
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)"
             )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_next_due ON memories(next_due)"
+            )
+            # Typed edges between memories (see add_relation):
+            #   same_event: src = member (child), dst = main
+            #   supersedes: src = newer record,  dst = the record it replaces
+            # No FK enforcement in this db — delete_memory / prune clean up
+            # edges in code (drop_relations).
+            had_rel_table = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='memory_relations'"
+            ).fetchone() is not None
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS memory_relations (
+                    src_id TEXT NOT NULL,
+                    dst_id TEXT NOT NULL,
+                    rel TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    created_by TEXT DEFAULT '',
+                    PRIMARY KEY (src_id, dst_id, rel)
+                )
+            """)
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rel_dst ON memory_relations(dst_id)"
+            )
+            if not had_rel_table:
+                sys.stderr.write(
+                    "[memstore] migration: created table memory_relations\n"
+                )
+            else:
+                # Edges whose row was deleted by code that predates relations
+                # (e.g. a rollback window) would leave members hidden from
+                # breath under a main that no longer exists. Sweep on startup.
+                _dangling = self.conn.execute(
+                    "DELETE FROM memory_relations "
+                    "WHERE src_id NOT IN (SELECT id FROM memories) "
+                    "OR dst_id NOT IN (SELECT id FROM memories)"
+                ).rowcount
+                if _dangling:
+                    sys.stderr.write(
+                        f"[memstore] relations: dropped {_dangling} dangling edge(s)\n"
+                    )
             self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -1937,6 +2143,17 @@ class MemoryStore:
         """
         cutoff = (datetime.now(timezone.utc) - timedelta(days=threshold_days)).isoformat()
         with self._lock:
+            # Drop relation edges of the rows about to go (both directions),
+            # same predicate, same transaction — no dangling edges.
+            _victims = (
+                "SELECT id FROM memories WHERE digested = 1 "
+                "AND COALESCE(NULLIF(last_active, ''), updated_at, created_at) < ?"
+            )
+            self.conn.execute(
+                f"DELETE FROM memory_relations WHERE src_id IN ({_victims}) "
+                f"OR dst_id IN ({_victims})",
+                (cutoff, cutoff),
+            )
             cur = self.conn.execute(
                 "DELETE FROM memories "
                 "WHERE digested = 1 "
@@ -2099,10 +2316,251 @@ class MemoryStore:
     def delete_memory(self, memory_id: str) -> bool:
         with self._lock:
             cur = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            if cur.rowcount > 0:
+                # children become standalone again (no promotion) — plan §Q2
+                self.drop_relations(memory_id, commit=False)
             self.conn.commit()
         if cur.rowcount > 0:
             self._mark_emb_dirty()
         return cur.rowcount > 0
+
+    # ---- memory_relations (same_event / supersedes edges) ----
+
+    def _memory_exists(self, memory_id: str) -> bool:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT 1 FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone() is not None
+
+    def resolve_main(self, memory_id: str) -> str:
+        """Follow same_event edges src→dst up to RELATION_MAX_HOPS; cycle-safe.
+        Returns memory_id itself when it is not a member of any group."""
+        cur = memory_id
+        seen = {memory_id}
+        with self._lock:
+            for _ in range(RELATION_MAX_HOPS):
+                row = self.conn.execute(
+                    "SELECT dst_id FROM memory_relations "
+                    "WHERE src_id = ? AND rel = 'same_event' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (cur,),
+                ).fetchone()
+                if row is None:
+                    break
+                nxt = str(row[0])
+                if nxt in seen:
+                    break
+                seen.add(nxt)
+                cur = nxt
+        return cur
+
+    def _same_event_members(self, root: str) -> list[str]:
+        """All ids whose same_event chain leads to *root* (BFS on incoming
+        edges, depth ≤ RELATION_MAX_HOPS), root itself excluded."""
+        out: list[str] = []
+        seen = {root}
+        frontier = [root]
+        with self._lock:
+            for _ in range(RELATION_MAX_HOPS):
+                if not frontier:
+                    break
+                nxt_frontier: list[str] = []
+                for node in frontier:
+                    for (src,) in self.conn.execute(
+                        "SELECT src_id FROM memory_relations "
+                        "WHERE dst_id = ? AND rel = 'same_event' "
+                        "ORDER BY created_at, src_id",
+                        (node,),
+                    ).fetchall():
+                        src = str(src)
+                        if src not in seen:
+                            seen.add(src)
+                            out.append(src)
+                            nxt_frontier.append(src)
+                frontier = nxt_frontier
+        return out
+
+    def _supersedes_reaches(self, start: str, target: str) -> bool:
+        """True if following supersedes edges src→dst from *start* reaches
+        *target* (bounded walk). Used to reject cycles."""
+        seen = {start}
+        frontier = [start]
+        with self._lock:
+            while frontier and len(seen) <= 256:
+                nxt_frontier: list[str] = []
+                for node in frontier:
+                    for (dst,) in self.conn.execute(
+                        "SELECT dst_id FROM memory_relations "
+                        "WHERE src_id = ? AND rel = 'supersedes'",
+                        (node,),
+                    ).fetchall():
+                        dst = str(dst)
+                        if dst == target:
+                            return True
+                        if dst not in seen:
+                            seen.add(dst)
+                            nxt_frontier.append(dst)
+                frontier = nxt_frontier
+        return False
+
+    def add_relation(
+        self, src_id: str, dst_id: str, rel: str, created_by: str = ""
+    ) -> dict[str, Any]:
+        """Add one typed edge. Raises ValueError with a readable message on
+        bad input (unknown rel, missing id, self-link, cycle); callers turn it
+        into an isError result or a save note — never a crash.
+
+        same_event: src=member, dst=main. dst is flattened to its root; a
+        member has exactly one main (a previous outgoing same_event edge of
+        src is replaced); if src itself had members they are re-pointed to the
+        new root so every group stays one level deep.
+        supersedes: src=new, dst=old. Chains are allowed, cycles rejected.
+        Returns {"src_id","dst_id","rel","created", "flattened_from"?,
+        "replaced"?, "repointed"?}.
+        """
+        src_id = str(src_id or "").strip()
+        dst_id = str(dst_id or "").strip()
+        rel = str(rel or "").strip()
+        if rel not in RELATION_TYPES:
+            raise ValueError(
+                f"invalid rel: {rel!r} (valid: {sorted(RELATION_TYPES)})"
+            )
+        if not src_id or not dst_id:
+            raise ValueError("src_id and dst_id are required")
+        if src_id == dst_id:
+            raise ValueError(f"cannot link a memory to itself ({src_id})")
+        now = datetime.now(timezone.utc).isoformat()
+        info: dict[str, Any] = {"src_id": src_id, "dst_id": dst_id, "rel": rel}
+        with self._lock:
+            for mid in (src_id, dst_id):
+                if not self._memory_exists(mid):
+                    raise ValueError(f"memory not found: {mid}")
+            if rel == "same_event":
+                root = self.resolve_main(dst_id)
+                if root != dst_id:
+                    info["flattened_from"] = dst_id
+                    info["dst_id"] = root
+                if root == src_id:
+                    raise ValueError(
+                        f"same_event cycle: {dst_id} already belongs to the group "
+                        f"whose main is {src_id}"
+                    )
+                prev = [
+                    str(r[0]) for r in self.conn.execute(
+                        "SELECT dst_id FROM memory_relations "
+                        "WHERE src_id = ? AND rel = 'same_event' AND dst_id != ?",
+                        (src_id, root),
+                    ).fetchall()
+                ]
+                if prev:
+                    self.conn.execute(
+                        "DELETE FROM memory_relations "
+                        "WHERE src_id = ? AND rel = 'same_event' AND dst_id != ?",
+                        (src_id, root),
+                    )
+                    info["replaced"] = prev
+                children = [
+                    str(r[0]) for r in self.conn.execute(
+                        "SELECT src_id FROM memory_relations "
+                        "WHERE dst_id = ? AND rel = 'same_event'",
+                        (src_id,),
+                    ).fetchall()
+                ]
+                for child in children:
+                    self.conn.execute(
+                        "DELETE FROM memory_relations "
+                        "WHERE src_id = ? AND dst_id = ? AND rel = 'same_event'",
+                        (child, src_id),
+                    )
+                    if child != root:
+                        self.conn.execute(
+                            "INSERT OR IGNORE INTO memory_relations"
+                            "(src_id, dst_id, rel, created_at, created_by) "
+                            "VALUES (?, ?, 'same_event', ?, ?)",
+                            (child, root, now, created_by),
+                        )
+                if children:
+                    info["repointed"] = children
+                dst_final = root
+            else:
+                if self._supersedes_reaches(dst_id, src_id):
+                    raise ValueError(
+                        f"supersedes cycle: {dst_id} already (transitively) "
+                        f"supersedes {src_id}"
+                    )
+                dst_final = dst_id
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO memory_relations"
+                "(src_id, dst_id, rel, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
+                (src_id, dst_final, rel, now, created_by),
+            )
+            info["created"] = cur.rowcount > 0
+            self.conn.commit()
+        return info
+
+    def remove_relation(self, src_id: str, dst_id: str, rel: str) -> bool:
+        """Delete exactly one edge. Returns True if a row was removed."""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM memory_relations "
+                "WHERE src_id = ? AND dst_id = ? AND rel = ?",
+                (str(src_id).strip(), str(dst_id).strip(), str(rel).strip()),
+            )
+            self.conn.commit()
+        return cur.rowcount > 0
+
+    def drop_relations(self, memory_id: str, commit: bool = True) -> int:
+        """Delete every edge touching *memory_id* (either side)."""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM memory_relations WHERE src_id = ? OR dst_id = ?",
+                (memory_id, memory_id),
+            )
+            if commit:
+                self.conn.commit()
+        return cur.rowcount
+
+    def relations_of(self, memory_id: str) -> dict[str, Any]:
+        """Relation summary for one id:
+          main               – root id of its same_event group (its own id when
+                               it is the main of a non-empty group), None when
+                               it is in no group
+          same_event_members – every member of that group except the main
+          supersedes         – ids this record supersedes (it is newer)
+          superseded_by      – ids that supersede this record
+        """
+        root = self.resolve_main(memory_id)
+        members = self._same_event_members(root)
+        main: str | None = root if (root != memory_id or members) else None
+        with self._lock:
+            sup = [
+                str(r[0]) for r in self.conn.execute(
+                    "SELECT dst_id FROM memory_relations "
+                    "WHERE src_id = ? AND rel = 'supersedes' ORDER BY created_at",
+                    (memory_id,),
+                ).fetchall()
+            ]
+            sup_by = [
+                str(r[0]) for r in self.conn.execute(
+                    "SELECT src_id FROM memory_relations "
+                    "WHERE dst_id = ? AND rel = 'supersedes' ORDER BY created_at",
+                    (memory_id,),
+                ).fetchall()
+            ]
+        return {
+            "main": main,
+            "same_event_members": members,
+            "supersedes": sup,
+            "superseded_by": sup_by,
+        }
+
+    @staticmethod
+    def excluded_ids_sql() -> tuple:
+        """(sql, params) selecting ids hidden from ranked breath segments:
+        non-main same_event members and superseded records. Splice as
+        ``AND id NOT IN (<sql>)``. Pinned rows must be exempted by the caller
+        (plan §Q2: pinned is never folded or excluded)."""
+        return (RELATION_EXCLUDED_IDS_SQL, ())
 
     def list_memories(
         self,
@@ -2336,6 +2794,7 @@ class MemoryStore:
             last_active=str(_get("last_active", "") or ""),
             tier=str(_get("tier", "") or ""),
             tier_until=str(_get("tier_until", "") or ""),
+            next_due=str(_get("next_due", "") or ""),
         )
 
 
@@ -3108,11 +3567,17 @@ TOOLS = [
         "description": (
             "Save or update a memory record. Persist preferences, events, facts, or anything "
             "worth remembering long-term. Embedding and emotion analysis run in the background "
-            "automatically on create. Passing an `id` that already exists is a partial update: "
-            "every field you omit keeps its stored value (including embedding, activation count "
-            "and last-active time), so you only need to send what actually changes — "
-            "except `key` and `content`, which stay required on every call (resend the "
-            "stored text unchanged if you are only flipping a flag). "
+            "automatically on create. `key` and `content` are required to CREATE a memory. "
+            "Passing an `id` that already exists is a partial update: every field you omit "
+            "keeps its stored value (key and content included, plus embedding, activation "
+            "count and last-active time), so send only what actually changes — e.g. "
+            "{id, resolved:true} or {id, next_due:'2026-10-07'}. With `append:true` the given "
+            "`content` is appended to the stored text on a new line (atomic; the full text is "
+            "re-embedded). An unknown `id` with key+content creates a record with that id; an "
+            "unknown `id` without them is an error. "
+            "`same_event_of` / `supersedes` link this memory to another one after saving "
+            "(link errors are reported in `note` and never fail the save; see "
+            "extmcp_link_memory). The result includes `content_preview` and `content_len`. "
             "Optional `tier` places the memory in the layered-memory architecture "
             "(working/watch/core/archive/seabed; '' = ordinary). On update, an omitted `tier` "
             "keeps the existing tier. Passing resolved=true on a `working` memory auto-archives "
@@ -3121,12 +3586,59 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "key": {"type": "string", "description": "Short title or label"},
-                "content": {"type": "string", "description": "Detailed content"},
+                "key": {
+                    "type": "string",
+                    "description": "Short title or label. Required on create; omit on update to keep.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": (
+                        "Detailed content. Required on create; omit on update to keep. "
+                        "With append=true, the text to append."
+                    ),
+                },
+                "append": {
+                    "type": "boolean",
+                    "description": (
+                        "Update only: append `content` to the stored text "
+                        "(old.rstrip() + newline + new) instead of replacing it. "
+                        "No date stamp is added — write your own. Default false."
+                    ),
+                },
                 "category": {
                     "type": "string",
-                    "enum": ["preference", "promise", "event", "anniversary", "emotion", "habit", "boundary", "other"],
+                    "enum": ["preference", "promise", "event", "anniversary", "emotion", "habit",
+                             "boundary", "nudge", "feedback", "knowledge", "other"],
                     "description": "Category (default: other on create). Omit to keep the current value on update.",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional session/group label (as used by extmcp_recall_session). "
+                        "Stored on create; on update only changed when given."
+                    ),
+                },
+                "next_due": {
+                    "type": "string",
+                    "description": (
+                        "Optional due date: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM', Toronto local "
+                        "time, no timezone suffix. Empty string clears it. Omit to keep on update. "
+                        "Invalid formats are rejected and nothing is saved."
+                    ),
+                },
+                "same_event_of": {
+                    "type": "string",
+                    "description": (
+                        "Optional id of the main record of the same event: this memory becomes "
+                        "a member of that group (flattened to the group's root)."
+                    ),
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": (
+                        "Optional id of an older record this memory replaces. The old record "
+                        "is not auto-resolved."
+                    ),
                 },
                 "importance": {
                     "type": "number",
@@ -3182,7 +3694,58 @@ TOOLS = [
                     ),
                 },
             },
-            "required": ["key", "content"],
+            "required": [],
+        },
+    },
+    {
+        "name": "extmcp_quicksave",
+        "description": (
+            "Fastest way to jot a new memory: only `content` is needed. The key is the first "
+            "non-empty line (clipped to 50 chars). Creates a new record exactly like "
+            "extmcp_save_memory's create path (background embedding + emotion analysis). "
+            "Returns the same shape as extmcp_save_memory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Memory text; first line becomes the key"},
+                "category": {
+                    "type": "string",
+                    "enum": ["preference", "promise", "event", "anniversary", "emotion", "habit",
+                             "boundary", "nudge", "feedback", "knowledge", "other"],
+                    "description": "Category (default other)",
+                },
+                "importance": {"type": "number", "description": "0.0 to 1.0 (default 0.5)"},
+                "tier": {
+                    "type": "string",
+                    "enum": ["", "working", "watch", "core", "archive", "seabed"],
+                    "description": "Layered-memory tier (default '' = ordinary)",
+                },
+                "session_id": {"type": "string", "description": "Optional session/group label"},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "extmcp_link_memory",
+        "description": (
+            "Add or remove a typed link between two existing memories. "
+            "rel='same_event': src is a member of the event whose main record is dst "
+            "(dst is flattened to its group's root; a member has one main). "
+            "rel='supersedes': src is the newer record that replaces dst (dst is NOT "
+            "auto-resolved). Self-links and cycles are rejected. remove=true deletes that "
+            "exact edge. Returns the updated relations of src_id "
+            "{main, same_event_members, supersedes, superseded_by}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "src_id": {"type": "string", "description": "Member (same_event) or newer record (supersedes)"},
+                "dst_id": {"type": "string", "description": "Main record (same_event) or older record (supersedes)"},
+                "rel": {"type": "string", "enum": ["same_event", "supersedes"]},
+                "remove": {"type": "boolean", "description": "Delete the edge instead of adding it (default false)"},
+            },
+            "required": ["src_id", "dst_id", "rel"],
         },
     },
     {
@@ -3191,6 +3754,10 @@ TOOLS = [
             f"Hybrid keyword (BM25) + vector ({OLLAMA_EMBED_MODEL} cosine) search over the memory store. "
             "Returns full content, valence, arousal, pinned, and decay_score per hit. "
             "Hits are touched (activation_count +1) as a side effect. "
+            "Linked rows are folded: a same_event group returns one item (the main) with "
+            "same_event_ids / same_event_count / matched_via; a superseded row is dropped "
+            "when its successor also matched (successor carries `supersedes`), or kept "
+            "with `superseded_by` otherwise. "
             "Tune `limit` yourself to match the task: 3-5 for precise lookup, 8 (default) "
             "for general recall, up to 40 for broad exploration. "
             "Context usage scales roughly linearly with `limit` — don't grab 40 when you need 5."
@@ -3336,15 +3903,29 @@ TOOLS = [
     {
         "name": "extmcp_dream",
         "description": (
-            "Introspective analysis of recent memories. Finds the most semantically "
-            f"connected pair (via {OLLAMA_EMBED_MODEL} cosine similarity) and generates a reflective "
-            "summary. Shows each memory's key, emotion scores (valence/arousal), "
-            "decay_score, and content. Call this to discover hidden connections or "
-            "decide which memories to resolve/digest. No parameters needed."
+            "Dedup / sync pass over the most recently updated memories (default 10). "
+            f"Finds the most similar pair (via {OLLAMA_EMBED_MODEL} cosine) and suggests "
+            "merge (>0.85), 同步 resolve, or keep; also lists each row's key, "
+            "valence/arousal, decay_score and content so you can resolve/digest. "
+            "Pairs already linked via same_event / supersedes are skipped. "
+            "This is a housekeeping tool over recent rows, not a far-association "
+            "search — distant associations come from the wake-up 联想 hook. "
+            "Optional: `min_sim` is the display threshold for that best pair (default 0.5; "
+            "lower it, e.g. 0.3, to still get a pair when nothing is that close), "
+            "`window` widens the recent-row window (2-40)."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "min_sim": {
+                    "type": "number",
+                    "description": "Show the best pair only if cosine > this (0-1, default 0.5).",
+                },
+                "window": {
+                    "type": "integer",
+                    "description": "How many most-recently-updated rows to compare (2-40, default 10).",
+                },
+            },
             "additionalProperties": False,
         },
     },
@@ -3395,6 +3976,11 @@ TOOLS = [
             "每次都端出最新的一条日记 / 周记 / 月记 / 年记（缺哪级就少哪行），"
             "内容按行截断，要全文用 extmcp_get_memory 按行首 id 取；"
             "这一段不参与激活，也不占用其余五段的篇幅预算。"
+            "WORKING 段先按 next_due 由近到远、再按更新时间排（过期超过 7 天的回落到按更新时间排，"
+            "行尾标〔已过期 N 天，疑似已完成未销账，请核对〕），每行正文截到 300 字"
+            "（尾注〔截断…〕，全文用 extmcp_get_memory 取）；"
+            "WORKING / WATCH 行尾带〔到期 MM-DD〕或〔已过期 N 天〕。"
+            "同事件的非主条与已被取代的旧条不在 CORE / WORKING / WATCH / TOP 段出现。"
         ),
         "inputSchema": {
             "type": "object",
@@ -3477,16 +4063,287 @@ TOOLS = [
 
 
 # ---------------------------------------------------------------------------
+# save_memory / quicksave shared helpers
+# ---------------------------------------------------------------------------
+
+def _bg_memory_update(store: MemoryStore, mid: str, txt: str | None,
+                      run_embed: bool, do_valence: bool, do_arousal: bool) -> None:
+    """Background embed / emotion pass for one row (daemon thread target).
+
+    txt=None → re-read the row's current content first (append path, so the
+    embedding always covers the latest full text). Ollama being down just
+    yields an empty embedding / fallback emotion; nothing escapes the thread.
+    """
+    try:
+        if txt is None:
+            with store._lock:
+                row = store.conn.execute(
+                    "SELECT content FROM memories WHERE id=?", (mid,)
+                ).fetchone()
+            if row is None:
+                return
+            txt = str(row[0] or "")
+        emb = _call_ollama_embedding(txt) if run_embed else []
+        updates: list[str] = []
+        params: list[Any] = []
+        if emb:
+            updates.append("embedding=?")
+            params.append(_pack_embedding(emb))
+        if do_valence or do_arousal:
+            v, a = _analyze_emotion(txt)
+            if do_valence:
+                updates.append("valence=?")
+                params.append(v)
+            if do_arousal:
+                updates.append("arousal=?")
+                params.append(a)
+        if updates:
+            params.append(mid)
+            with store._lock:
+                store.conn.execute(
+                    f"UPDATE memories SET {', '.join(updates)} WHERE id=?",
+                    tuple(params),
+                )
+                store.conn.commit()
+            if emb:
+                store._mark_emb_dirty()
+    except Exception as exc:
+        sys.stderr.write(f"[memory-mcp] bg update failed for {mid}: {exc}\n")
+        sys.stderr.flush()
+
+
+def _apply_tier_write(store: MemoryStore, memory_id: str,
+                      user_tier: str | None, prev_tier: str,
+                      prev_tier_until: str, resolved_given: bool,
+                      resolved_val: bool) -> tuple:
+    """Tier resolution after a save (narrow write, never through upsert).
+    Returns (final_tier, final_until, auto_archived)."""
+    final_tier = user_tier if user_tier is not None else prev_tier
+    final_until = prev_tier_until
+    auto_archived = False
+    # Auto-archive: resolving a working memory closes the loop → biography.
+    # Requires resolved=true *in this call*, so an unrelated edit to an
+    # already-resolved working memory doesn't silently archive it.
+    if resolved_given and resolved_val and final_tier == "working":
+        final_tier = "archive"
+        final_until = ""
+        auto_archived = True
+
+    need_tier_write = auto_archived or (
+        user_tier is not None and user_tier != prev_tier
+    )
+    if need_tier_write:
+        if final_tier == "watch":
+            # keep an existing watch expiry, else stamp the default window
+            if not (prev_tier == "watch" and prev_tier_until):
+                final_until = (
+                    datetime.now(timezone.utc)
+                    + timedelta(days=WATCH_DEFAULT_DAYS)
+                ).isoformat()
+            else:
+                final_until = prev_tier_until
+        else:
+            final_until = ""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with store._lock:
+            store.conn.execute(
+                "UPDATE memories SET tier=?, tier_until=?, updated_at=? WHERE id=?",
+                (final_tier, final_until, now_iso, memory_id),
+            )
+            store.conn.commit()
+    return final_tier, final_until, auto_archived
+
+
+def _create_memory_record(
+    store: MemoryStore,
+    *,
+    memory_id: str,
+    key: str,
+    content: str,
+    category: str = "other",
+    importance: float = 0.5,
+    valence: float | None = None,
+    arousal: float | None = None,
+    pinned: bool = False,
+    resolved: bool = False,
+    resolved_given: bool = False,
+    digested: bool = False,
+    session_id: str = "",
+    next_due: str = "",
+    tier: str | None = None,
+) -> tuple:
+    """Create one memory row the way extmcp_save_memory always has: full
+    upsert with defaults, optional next_due / tier narrow writes, then a bg
+    thread for the embedding and whichever emotion axis was left out
+    (valence/arousal=None → auto-detect). Caller validates tier/next_due.
+
+    Returns (rec, meta) with meta = {"tier", "tier_until", "auto_archived",
+    "bg_parts"}.
+    """
+    rec = store.upsert_memory(
+        memory_id=memory_id, key=key, content=content,
+        category=category, importance=importance,
+        session_id=session_id,
+        pinned=pinned, resolved=resolved, digested=digested,
+        valence=0.5 if valence is None else valence,
+        arousal=0.3 if arousal is None else arousal,
+    )
+    if next_due:
+        with store._lock:
+            store.conn.execute(
+                "UPDATE memories SET next_due=? WHERE id=?", (next_due, memory_id)
+            )
+            store.conn.commit()
+    final_tier, final_until, auto_archived = _apply_tier_write(
+        store, memory_id, tier, "", "", resolved_given, resolved,
+    )
+    # Auto-detect only the emotion axis the caller left out (an omitted
+    # arousal must not drag an explicitly given valence along with it).
+    write_valence = valence is None
+    write_arousal = arousal is None
+    threading.Thread(
+        target=_bg_memory_update,
+        args=(store, memory_id, content, True, write_valence, write_arousal),
+        daemon=True,
+    ).start()
+    bg_parts = ["embedding"]
+    if write_valence and write_arousal:
+        bg_parts.append("emotion analysis")
+    elif write_valence:
+        bg_parts.append("valence detection")
+    elif write_arousal:
+        bg_parts.append("arousal detection")
+    return rec, {
+        "tier": final_tier, "tier_until": final_until,
+        "auto_archived": auto_archived, "bg_parts": bg_parts,
+    }
+
+
+def _content_preview(content: str, n: int = 50) -> str:
+    content = content or ""
+    if len(content) <= n:
+        return content
+    return f"{content[:n]}…（共 {len(content)} 字）"
+
+
+def _save_result(rec: MemoryRecord, final_tier: str, final_until: str,
+                 note: str, extra: dict[str, Any] | None = None) -> list:
+    """Uniform JSON result for extmcp_save_memory / extmcp_quicksave."""
+    out: dict[str, Any] = {
+        "ok": True, "id": rec.id, "key": rec.key,
+        "category": rec.category, "importance": rec.importance,
+        "valence": rec.valence, "arousal": rec.arousal,
+        "pinned": rec.pinned, "resolved": rec.resolved,
+        "tier": final_tier, "tier_until": final_until,
+        "next_due": rec.next_due, "session_id": rec.session_id,
+        "decay_score": _calc_decay_score(rec),
+        "content_preview": _content_preview(rec.content),
+        "content_len": len(rec.content or ""),
+        "note": note,
+    }
+    if extra:
+        out.update(extra)
+    return [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}]
+
+
+# ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
 
+def _fold_search_results(store: MemoryStore, results: list) -> list[dict]:
+    """Fold raw search hits by memory_relations (plan §Q3). Returns groups in
+    the search's own rank order (a group sits where its first hit sat):
+
+      {"rec": MemoryRecord shown (the group's root main),
+       "score": best final_score among the group's hits (and of any
+                superseded group it absorbed),
+       "hits": [matched MemoryRecords, rank order],
+       "members": same_event members of the main (main excluded) — [] when the
+                  main heads no group,
+       "supersedes": ids of superseded rows that matched and were dropped in
+                     favour of this item,
+       "superseded_by": ids superseding this item when none of them is in the
+                        output}
+
+    A group sits at its first hit's rank; a successor that absorbs superseded
+    groups moves up to the best rank among them. A main that
+    was not itself a hit is fetched with get_memory (falls back to the best
+    hit if the row is gone). Supersedes is judged on the shown record's id.
+    """
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    for r in results:
+        # Pinned rows are never folded (plan §Q2): a pinned member stays its
+        # own item instead of collapsing into its main.
+        main_id = r.id if r.pinned else store.resolve_main(r.id)
+        g = groups.get(main_id)
+        if g is None:
+            g = {"main_id": main_id, "hits": [], "score": float(r.final_score)}
+            groups[main_id] = g
+            order.append(main_id)
+        g["hits"].append(r)
+        g["score"] = max(g["score"], float(r.final_score))
+
+    for main_id in order:
+        g = groups[main_id]
+        rec = next((h for h in g["hits"] if h.id == main_id), None)
+        if rec is None:
+            rec = store.get_memory(main_id) or g["hits"][0]
+        g["rec"] = rec
+        g["members"] = store._same_event_members(rec.id) if rec.id == main_id else []
+        rel = store.relations_of(rec.id)
+        g["_sup_by"] = [x for x in rel["superseded_by"] if x != rec.id]
+        g["supersedes"] = []
+        g["superseded_by"] = []
+
+    shown = {groups[m]["rec"].id: m for m in order}
+
+    def _survivor(main_id: str) -> str | None:
+        """Group id that absorbs this one: walk superseded_by edges that land
+        inside the output; None when nothing newer is present."""
+        if groups[main_id]["rec"].pinned:
+            return None  # pinned is never dropped in favour of a successor
+        seen = {main_id}
+        cur = main_id
+        moved = False
+        while True:
+            nxt = next(
+                (shown[x] for x in groups[cur]["_sup_by"] if x in shown and shown[x] not in seen),
+                None,
+            )
+            if nxt is None:
+                return cur if moved else None
+            seen.add(nxt)
+            cur = nxt
+            moved = True
+
+    # A dropped (superseded) group hands its rank slot and score to the
+    # successor that absorbs it; otherwise a high-ranked old row could vanish
+    # while its lower-ranked successor falls off the `limit` cut.
+    absorbed_into: dict[str, str] = {}
+    for main_id in order:
+        tgt = _survivor(main_id)
+        if tgt is None or tgt == main_id:
+            continue
+        absorbed_into[main_id] = tgt
+        groups[tgt]["supersedes"].append(groups[main_id]["rec"].id)
+        groups[tgt]["score"] = max(groups[tgt]["score"], groups[main_id]["score"])
+    out: list[dict] = []
+    emitted: set[str] = set()
+    for main_id in order:
+        target = absorbed_into.get(main_id, main_id)
+        if target in emitted:
+            continue
+        emitted.add(target)
+        g = groups[target]
+        g["superseded_by"] = [x for x in g["_sup_by"] if x not in shown]
+        out.append(g)
+    return out
+
+
+
 def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
     if name == "extmcp_save_memory":
-        key = str(args.get("key", "")).strip()
-        content = str(args.get("content", "")).strip()
-        if not key or not content:
-            raise ValueError("key and content are required")
-
         def _given(k: str) -> bool:
             """True only if the caller explicitly sent a non-null value.
 
@@ -3496,7 +4353,12 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             """
             return k in args and args[k] is not None
 
-        memory_id = str(args.get("id", "")).strip()
+        key = str(args["key"]).strip() if _given("key") else ""
+        content = str(args["content"]).strip() if _given("content") else ""
+        append_mode = bool(args.get("append") or False)
+
+        memory_id = str(args.get("id", "") or "").strip()
+        explicit_id = bool(memory_id)
         if not memory_id:
             memory_id = f"mem_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
 
@@ -3507,23 +4369,32 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 raise ValueError(
                     f"invalid tier: {user_tier!r} (valid: {sorted(VALID_TIERS)})"
                 )
+        # Validate before any write: a bad next_due must not half-save.
+        next_due_given = _given("next_due")
+        next_due_val = _parse_next_due(args["next_due"]) if next_due_given else ""
+        same_event_of = str(args.get("same_event_of", "") or "").strip()
+        supersedes_id = str(args.get("supersedes", "") or "").strip()
 
         # The pre-existing row decides the branch *and* carries the tier across:
         # upsert_memory deliberately does NOT touch tier/tier_until, so on insert
-        # it defaults to '' and any tier change is a separate narrow write below.
+        # it defaults to '' and any tier change is a separate narrow write.
         existing_rec = store.get_memory(memory_id)
         is_update = existing_rec is not None
-        prev_tier = existing_rec.tier if existing_rec else ""
-        prev_tier_until = existing_rec.tier_until if existing_rec else ""
 
         resolved_given = _given("resolved")
         resolved_val = bool(args["resolved"]) if resolved_given else False
+        notes: list[str] = []
 
         if is_update:
             # ---- UPDATE: narrow write of exactly the fields that were sent ----
-            # Anything omitted keeps its stored value; session_id, memory_kind,
-            # activation_count, last_active and embedding are never touched here.
-            fields: Dict[str, Any] = {"key": key, "content": content}
+            # Anything omitted keeps its stored value (key/content included);
+            # memory_kind, activation_count, last_active and embedding are
+            # never touched here.
+            fields: dict[str, Any] = {}
+            if key:
+                fields["key"] = key
+            if content and not append_mode:
+                fields["content"] = content
             if _given("category"):
                 new_category = str(args["category"]).strip()
                 if new_category:          # empty string = "no opinion", keep old
@@ -3540,6 +4411,10 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 fields["resolved"] = int(resolved_val)
             if _given("digested"):
                 fields["digested"] = int(bool(args["digested"]))
+            if _given("session_id"):
+                fields["session_id"] = str(args["session_id"]).strip()
+            if next_due_given:
+                fields["next_due"] = next_due_val
             # Same invariant upsert_memory enforces: a pinned memory is max-important.
             final_pinned = (
                 bool(args["pinned"]) if _given("pinned") else existing_rec.pinned
@@ -3547,115 +4422,92 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             if final_pinned:
                 fields["importance"] = 1.0
 
-            store.update_memory_fields(memory_id, fields)
-            rec = store.get_memory(memory_id) or existing_rec
-            # Only re-embed when the text actually changed; emotion is never
-            # re-run on update (omitted valence/arousal = keep what's stored).
-            do_embed = content != existing_rec.content
-            write_valence = False
-            write_arousal = False
-        else:
-            # ---- CREATE: full-row upsert with defaults (unchanged behaviour) ----
-            category = str(args.get("category", "other") or "other").strip() or "other"
-            importance = (
-                max(0.0, min(1.0, float(args["importance"])))
-                if _given("importance") else 0.5
-            )
-            valence = float(args["valence"]) if _given("valence") else 0.5
-            arousal = float(args["arousal"]) if _given("arousal") else 0.3
-            rec = store.upsert_memory(
-                memory_id=memory_id, key=key, content=content,
-                category=category, importance=importance,
-                pinned=bool(args.get("pinned") or False),
-                resolved=resolved_val,
-                digested=bool(args.get("digested") or False),
-                valence=valence, arousal=arousal,
-            )
-            do_embed = True
-            # Auto-detect only the emotion axis the caller left out (an omitted
-            # arousal must not drag an explicitly given valence along with it).
-            write_valence = not _given("valence")
-            write_arousal = not _given("arousal")
-
-        # ---- tier resolution (narrow write, never through upsert) ----
-        final_tier = user_tier if user_tier is not None else prev_tier
-        final_until = prev_tier_until
-        auto_archived = False
-        # Auto-archive: resolving a working memory closes the loop → biography.
-        # Requires resolved=true *in this call*, so an unrelated edit to an
-        # already-resolved working memory doesn't silently archive it.
-        if resolved_given and resolved_val and final_tier == "working":
-            final_tier = "archive"
-            final_until = ""
-            auto_archived = True
-
-        need_tier_write = auto_archived or (
-            user_tier is not None and user_tier != prev_tier
-        )
-        if need_tier_write:
-            if final_tier == "watch":
-                # keep an existing watch expiry, else stamp the default window
-                if not (prev_tier == "watch" and prev_tier_until):
-                    final_until = (
-                        datetime.now(timezone.utc)
-                        + timedelta(days=WATCH_DEFAULT_DAYS)
-                    ).isoformat()
-                else:
-                    final_until = prev_tier_until
-            else:
-                final_until = ""
-            now_iso = datetime.now(timezone.utc).isoformat()
             with store._lock:
-                store.conn.execute(
-                    "UPDATE memories SET tier=?, tier_until=?, updated_at=? WHERE id=?",
-                    (final_tier, final_until, now_iso, memory_id),
-                )
-                store.conn.commit()
-
-        def _bg_update(mid: str, txt: str, run_embed: bool,
-                       do_valence: bool, do_arousal: bool) -> None:
-            emb = _call_ollama_embedding(txt) if run_embed else []
-            updates: list[str] = []
-            params: list[Any] = []
-            if emb:
-                updates.append("embedding=?")
-                params.append(_pack_embedding(emb))
-            if do_valence or do_arousal:
-                v, a = _analyze_emotion(txt)
-                if do_valence:
-                    updates.append("valence=?")
-                    params.append(v)
-                if do_arousal:
-                    updates.append("arousal=?")
-                    params.append(a)
-            if updates:
-                params.append(mid)
-                with store._lock:
+                store.update_memory_fields(memory_id, fields)
+                if append_mode and content:
+                    # Atomic append: no read-modify-write window between
+                    # concurrent appenders. rtrim ≈ Python str.rstrip().
                     store.conn.execute(
-                        f"UPDATE memories SET {', '.join(updates)} WHERE id=?",
-                        tuple(params),
+                        "UPDATE memories SET content = "
+                        "rtrim(content, char(32, 9, 10, 13)) || char(10) || ?, "
+                        "updated_at = ? WHERE id = ?",
+                        (content, datetime.now(timezone.utc).isoformat(), memory_id),
                     )
                     store.conn.commit()
-                if emb:
-                    store._mark_emb_dirty()
+                rec = store.get_memory(memory_id) or existing_rec
+            if append_mode and not content:
+                notes.append("append=true with empty content: nothing appended")
+            # Only re-embed when the text actually changed; emotion is never
+            # re-run on update (omitted valence/arousal = keep what's stored).
+            do_embed = rec.content != existing_rec.content
+            if do_embed:
+                # txt=None → the bg thread re-reads the row, so back-to-back
+                # appends each embed the freshest full text.
+                threading.Thread(
+                    target=_bg_memory_update,
+                    args=(store, memory_id, None, True, False, False),
+                    daemon=True,
+                ).start()
 
-        if do_embed or write_valence or write_arousal:
-            threading.Thread(
-                target=_bg_update,
-                args=(memory_id, content, do_embed, write_valence, write_arousal),
-                daemon=True,
-            ).start()
+            final_tier, final_until, auto_archived = _apply_tier_write(
+                store, memory_id, user_tier, existing_rec.tier,
+                existing_rec.tier_until, resolved_given, resolved_val,
+            )
+            bg_parts = ["embedding"] if do_embed else []
+        else:
+            # ---- CREATE: key + content are mandatory here, never a blank row ----
+            if not key or not content:
+                if explicit_id:
+                    raise ValueError(
+                        f"id not found: {memory_id!r}; creating a new memory "
+                        "requires both key and content (id 不存在，创建需要 key 和 content)"
+                    )
+                raise ValueError("key and content are required to create a memory")
+            if explicit_id:
+                notes.append("id not found, created new record with given id")
+            if append_mode:
+                notes.append("append ignored on create")
+            rec, meta = _create_memory_record(
+                store,
+                memory_id=memory_id, key=key, content=content,
+                category=str(args.get("category", "other") or "other").strip() or "other",
+                importance=(
+                    max(0.0, min(1.0, float(args["importance"])))
+                    if _given("importance") else 0.5
+                ),
+                valence=float(args["valence"]) if _given("valence") else None,
+                arousal=float(args["arousal"]) if _given("arousal") else None,
+                pinned=bool(args.get("pinned") or False),
+                resolved=resolved_val, resolved_given=resolved_given,
+                digested=bool(args.get("digested") or False),
+                session_id=(
+                    str(args["session_id"]).strip() if _given("session_id") else ""
+                ),
+                next_due=next_due_val,
+                tier=user_tier,
+            )
+            final_tier = meta["tier"]
+            final_until = meta["tier_until"]
+            auto_archived = meta["auto_archived"]
+            bg_parts = meta["bg_parts"]
 
-        ds = _calc_decay_score(rec)
-        bg_parts: list[str] = []
-        if do_embed:
-            bg_parts.append("embedding")
-        if write_valence and write_arousal:
-            bg_parts.append("emotion analysis")
-        elif write_valence:
-            bg_parts.append("valence detection")
-        elif write_arousal:
-            bg_parts.append("arousal detection")
+        # ---- relation edges (never fail the save; errors go to the note) ----
+        rel_touched = False
+        for rel_name, target in (("same_event", same_event_of),
+                                 ("supersedes", supersedes_id)):
+            if not target:
+                continue
+            rel_touched = True
+            try:
+                info = store.add_relation(memory_id, target, rel_name,
+                                          created_by="save_memory")
+                if info.get("flattened_from"):
+                    notes.append(
+                        f"same_event flattened: {target} → main {info['dst_id']}"
+                    )
+            except Exception as exc:
+                notes.append(f"{rel_name} link failed: {exc}")
+
         note = (
             " & ".join(bg_parts) + " running in background"
             if bg_parts else "no background work"
@@ -3664,15 +4516,68 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             note += "; unspecified fields preserved"
         if auto_archived:
             note = "working 记忆已结案，自动归档 (tier→archive)；" + note
-        return [{"type": "text", "text": json.dumps({
-            "ok": True, "id": rec.id, "key": rec.key,
-            "category": rec.category, "importance": rec.importance,
-            "valence": rec.valence, "arousal": rec.arousal,
-            "pinned": rec.pinned, "resolved": rec.resolved,
-            "tier": final_tier, "tier_until": final_until,
-            "decay_score": ds,
-            "note": note,
-        }, ensure_ascii=False)}]
+        if notes:
+            note += "; " + "; ".join(notes)
+        rec = store.get_memory(memory_id) or rec
+        extra: dict[str, Any] = {}
+        if rel_touched:
+            extra["relations"] = store.relations_of(memory_id)
+        return _save_result(rec, final_tier, final_until, note, extra)
+
+    elif name == "extmcp_quicksave":
+        content = str(args.get("content", "") or "").strip()
+        if not content:
+            raise ValueError("content is required")
+        user_tier = str(args.get("tier", "") or "").strip()
+        if user_tier not in VALID_TIERS:
+            raise ValueError(
+                f"invalid tier: {user_tier!r} (valid: {sorted(VALID_TIERS)})"
+            )
+        first_line = next(
+            (ln.strip() for ln in content.splitlines() if ln.strip()), content
+        )
+        key = first_line[:50]
+        imp_raw = args.get("importance")
+        importance = 0.5 if imp_raw is None else max(0.0, min(1.0, float(imp_raw)))
+        memory_id = f"mem_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        rec, meta = _create_memory_record(
+            store,
+            memory_id=memory_id, key=key, content=content,
+            category=str(args.get("category", "other") or "other").strip() or "other",
+            importance=importance,
+            session_id=str(args.get("session_id", "") or "").strip(),
+            tier=user_tier or None,
+        )
+        note = (
+            " & ".join(meta["bg_parts"]) + " running in background"
+            if meta["bg_parts"] else "no background work"
+        )
+        rec = store.get_memory(memory_id) or rec
+        return _save_result(rec, meta["tier"], meta["tier_until"], note)
+
+    elif name == "extmcp_link_memory":
+        src_id = str(args.get("src_id", "") or "").strip()
+        dst_id = str(args.get("dst_id", "") or "").strip()
+        rel = str(args.get("rel", "") or "").strip()
+        remove = bool(args.get("remove") or False)
+        if not src_id or not dst_id:
+            raise ValueError("src_id and dst_id are required")
+        if rel not in RELATION_TYPES:
+            raise ValueError(
+                f"invalid rel: {rel!r} (valid: {sorted(RELATION_TYPES)})"
+            )
+        for mid in (src_id, dst_id):
+            if store.get_memory(mid) is None:
+                raise ValueError(f"memory not found: {mid}")
+        if remove:
+            removed = store.remove_relation(src_id, dst_id, rel)
+            result: dict[str, Any] = {"ok": True, "action": "remove",
+                                      "removed": removed}
+        else:
+            info = store.add_relation(src_id, dst_id, rel, created_by="link_memory")
+            result = {"ok": True, "action": "add", **info}
+        result["relations"] = store.relations_of(src_id)
+        return [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]
 
     elif name == "extmcp_search_memory":
         query = str(args.get("query", "")).strip()
@@ -3680,30 +4585,56 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             raise ValueError("query is required")
         limit = max(1, min(40, int(args.get("limit", 8) or 8)))
         query_embedding = _call_ollama_embedding(query) or None
-        results = store.search(query, query_embedding=query_embedding, limit=limit)
-        for r in results:
-            store.touch_memory(r.id)
-        items = [
-            {
+        # Over-fetch so folding (same_event groups collapse to one item,
+        # superseded rows drop out) can still return `limit` items.
+        fetch_n = min(80, limit * 2)
+        results = store.search(query, query_embedding=query_embedding, limit=fetch_n)
+        folded = _fold_search_results(store, results)[:limit]
+
+        # Touch only rows that actually matched and are represented in the
+        # output. Mains pulled in for a member hit are not touched; neither are
+        # superseded rows dropped in favour of their successor, nor the tail
+        # beyond `limit` that only the over-fetch saw.
+        touched: set[str] = set()
+        for g in folded:
+            for r in g["hits"]:
+                if r.id not in touched:
+                    touched.add(r.id)
+                    store.touch_memory(r.id)
+
+        items = []
+        for g in folded:
+            r = g["rec"]
+            item = {
                 "id": r.id, "key": r.key, "content": r.content,
                 "category": r.category, "importance": r.importance,
                 "session_id": r.session_id,
-                "score": round(r.final_score, 4),
+                "score": round(g["score"], 4),
                 "valence": r.valence, "arousal": r.arousal,
                 "pinned": r.pinned, "tier": r.tier,
+                "next_due": r.next_due,
                 "decay_score": _calc_decay_score(r),
             }
-            for r in results
-        ]
+            if g["members"]:
+                item["same_event_ids"] = list(g["members"])
+                item["same_event_count"] = len(g["members"])
+                item["matched_via"] = [h.id for h in g["hits"]]
+            if g["supersedes"]:
+                item["supersedes"] = list(g["supersedes"])
+            if g["superseded_by"]:
+                item["superseded_by"] = list(g["superseded_by"])
+            items.append(item)
         # Aggregate hits by session_id — signals to the caller which sessions
         # have multiple fragments and are worth recalling in full via
         # extmcp_recall_session to reconstruct the original narrative.
+        # Counted over the rows that actually matched (not fetched-in mains).
         session_agg: Dict[str, Dict[str, Any]] = {}
-        for r in results:
-            sid = r.session_id or "(no session)"
-            bucket = session_agg.setdefault(sid, {"hit_count": 0, "ids": []})
-            bucket["hit_count"] += 1
-            bucket["ids"].append(r.id)
+        for g in folded:
+            for r in g["hits"]:
+                sid = r.session_id or "(no session)"
+                bucket = session_agg.setdefault(sid, {"hit_count": 0, "ids": []})
+                bucket["hit_count"] += 1
+                bucket["ids"].append(r.id)
         multi_hit = {k: v for k, v in session_agg.items() if v["hit_count"] >= 2}
         return [{"type": "text", "text": json.dumps({
             "query": query,
@@ -3737,6 +4668,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                     "updated_at": r.updated_at,
                     "valence": r.valence, "arousal": r.arousal,
                     "pinned": r.pinned, "tier": r.tier,
+                    "next_due": r.next_due,
                     "decay_score": _calc_decay_score(r),
                 }
                 for r in results
@@ -3750,6 +4682,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                     "updated_at": r.updated_at,
                     "decay_score": _calc_decay_score(r),
                     "pinned": r.pinned, "tier": r.tier,
+                    "next_due": r.next_due,
                 }
                 for r in results
             ]
@@ -3794,7 +4727,9 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 "resolved": r.resolved, "digested": r.digested,
                 "valence": r.valence, "arousal": r.arousal,
                 "created_at": r.created_at, "updated_at": r.updated_at,
+                "next_due": r.next_due,
                 "decay_score": _calc_decay_score(r),
+                "relations": store.relations_of(r.id),
             }
             for r in recs
         ]
@@ -3978,12 +4913,27 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         # are re-written in batches, so they would otherwise flood the
         # "10 most recently updated" window and drown the raw memories dream
         # exists to look at. They stay reachable through search / get_memory.
+        try:
+            window = int(args.get("window", 10) if args.get("window") is not None else 10)
+        except (TypeError, ValueError):
+            raise ValueError("window must be an integer (2-40)") from None
+        window = max(2, min(40, window))
+        min_sim_arg = args.get("min_sim")
+        if min_sim_arg is None:
+            min_sim = 0.5
+        else:
+            try:
+                min_sim = float(min_sim_arg)
+            except (TypeError, ValueError):
+                raise ValueError("min_sim must be a number between 0 and 1") from None
+            if not (0.0 <= min_sim <= 1.0):
+                raise ValueError("min_sim must be between 0 and 1")
         with store._lock:
             rows = store.conn.execute(
                 "SELECT * FROM memories WHERE memory_kind='long_term' AND pinned=0 AND digested=0 "
                 "AND COALESCE(category,'') <> ? "
-                "ORDER BY updated_at DESC LIMIT 10",
-                (BREATH_CHRONICLE_CATEGORY,),
+                "ORDER BY updated_at DESC LIMIT ?",
+                (BREATH_CHRONICLE_CATEGORY, window),
             ).fetchall()
         recs = [store._row_to_record(r) for r in rows]
         if not recs:
@@ -4000,16 +4950,42 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 "SELECT id, embedding FROM memories "
                 "WHERE memory_kind='long_term' AND pinned=0 AND digested=0 AND length(embedding)>0 "
                 "AND COALESCE(category,'') <> ? "
-                "ORDER BY updated_at DESC LIMIT 10",
-                (BREATH_CHRONICLE_CATEGORY,),
+                "ORDER BY updated_at DESC LIMIT ?",
+                (BREATH_CHRONICLE_CATEGORY, window),
             ).fetchall()
         emb_map: dict[str, list] = {r["id"]: _unpack_embedding(r["embedding"]) for r in emb_rows}
+
+        # Pairs already linked in memory_relations (either rel, either
+        # direction) are known to belong together — skip them so dream spends
+        # its one slot on an unfiled pair.
+        linked: set[frozenset] = set()
+        if emb_map:
+            _ids = list(emb_map.keys())
+            _ph = ",".join("?" * len(_ids))
+            with store._lock:
+                for a, b in store.conn.execute(
+                    f"SELECT src_id, dst_id FROM memory_relations "
+                    f"WHERE src_id IN ({_ph}) AND dst_id IN ({_ph})",
+                    tuple(_ids) + tuple(_ids),
+                ).fetchall():
+                    linked.add(frozenset((str(a), str(b))))
+            # Siblings of one same_event group have no direct edge (both point
+            # at the main) but are just as filed — skip them too.
+            _root = {mid: store.resolve_main(mid) for mid in _ids}
+            for i_, a in enumerate(_ids):
+                for b in _ids[i_ + 1:]:
+                    if _root[a] == _root[b]:
+                        linked.add(frozenset((a, b)))
 
         best_pair: Optional[tuple] = None
         best_sim = 0.0
         ids_with_emb = list(emb_map.keys())
+        skipped_linked = 0
         for i in range(len(ids_with_emb)):
             for j in range(i + 1, len(ids_with_emb)):
+                if frozenset((ids_with_emb[i], ids_with_emb[j])) in linked:
+                    skipped_linked += 1
+                    continue
                 sim = _cosine_similarity(emb_map[ids_with_emb[i]], emb_map[ids_with_emb[j]])
                 if sim > best_sim:
                     best_sim = sim
@@ -4017,8 +4993,10 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
 
         rec_map = {r.id: r for r in recs}
         lines = [f"# Dream — 记忆自省\n\n共分析 {len(recs)} 条记忆\n"]
+        if skipped_linked:
+            lines.append(f"（已跳过 {skipped_linked} 对已建立关联的记忆）\n")
 
-        if best_pair and best_sim > 0.5:
+        if best_pair and best_sim > min_sim:
             lines.append(f"## 最强关联对 (相似度 {best_sim:.3f})\n")
             for mid in best_pair:
                 if mid in rec_map:
@@ -4045,7 +5023,9 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 "或用 extmcp_save_memory 写下新的感受。\n"
             )
         else:
-            lines.append("（当前记忆尚无相似度 >0.5 的关联对，或 embedding 尚未生成）\n")
+            lines.append(
+                f"（当前记忆尚无相似度 >{min_sim:g} 的关联对，或 embedding 尚未生成）\n"
+            )
 
         lines.append("## 所有记忆概览\n")
         for rec in recs:
