@@ -9,6 +9,8 @@ A lightweight SQLite-backed MCP memory server with hybrid retrieval (keyword + v
 - Save, search, list and delete memory entries
 - BM25 keyword search fused with qwen3-embedding:4b vector cosine similarity
 - Ebbinghaus decay formula weighted by emotional arousal
+- `same_event` / `supersedes` relations fold duplicate or outdated records out of breath, search and dream
+- Optional `next_due` date on working memories, surfaced and sorted in breath
 - Chinese summarization / sentiment analysis / memory extraction via a local Ollama model
 - Two transports: stdio (Claude Desktop) and Streamable HTTP (phones, remote clients)
 - Drag-and-drop web UI for importing conversation history, with automatic format detection (Claude official export / plugin export / ChatGPT mapping)
@@ -43,21 +45,25 @@ python memory_mcp.py --http --port 3456 --db ./memory.db
 
 ## MCP tools
 
+> Adding a tool here doesn't make it appear on claude.ai by itself — the connector caches the tool list, so disconnect and reconnect it (Settings → Connectors) after an update to pick up new/changed tools.
+
 | Tool | Description |
 |---|---|
-| `extmcp_save_memory` | Save/update a memory; embedding + sentiment run in a background worker. **Updates (with `id`) are partial since 2026-07-30**: any field you omit keeps its stored value — `category` / `importance` / `valence` / `arousal` / `pinned` / `resolved` / `digested` / `session_id` / `activation_count` are no longer reset to defaults, and the embedding is only recomputed when the content actually changes |
-| `extmcp_search_memory` | Hybrid keyword + vector search (hits bump `activation_count`) |
+| `extmcp_save_memory` | Save/update a memory; embedding + sentiment run in a background worker. **Updates (with `id`) are partial since 2026-07-30**: any field you omit keeps its stored value — `category` / `importance` / `valence` / `arousal` / `pinned` / `resolved` / `digested` / `session_id` / `activation_count` are no longer reset to defaults, and the embedding is only recomputed when the content actually changes. New: `append` (atomically appends `content` to the stored text on a new line, re-embeds the full thing), `session_id`, `next_due` (due date, see [Relations & due dates](#relations--due-dates)), `same_event_of` / `supersedes` (link this memory to another on save). Response now includes `content_preview`, `content_len` and `next_due`. `category` also accepts `nudge` / `feedback` / `knowledge` (not enforced server-side — any string is stored) |
+| `extmcp_quicksave` | Fastest way to jot a new memory: only `content` is required. Key = its first non-empty line, clipped to 50 chars. Same create path as `extmcp_save_memory` |
+| `extmcp_link_memory` | Add or remove a typed link between two existing memories (`rel`: `same_event` or `supersedes`; `remove=true` deletes the edge). See [Relations & due dates](#relations--due-dates) |
+| `extmcp_search_memory` | Hybrid keyword + vector search (hits bump `activation_count`); folds linked rows — a `same_event` group returns once (the main record, with `same_event_ids`/`same_event_count`), and a superseded row is dropped when its successor also matched, else kept with `superseded_by` |
 | `extmcp_list_memories` | List by update time, newest first |
 | `extmcp_delete_memory` | Delete one entry |
 | `extmcp_summarize_recent` | Chinese summary of the last N memories (`limit` 1-30, default 10); activates what it cites |
 | `extmcp_random_memories` | Draw 4-10 entries at random |
-| `extmcp_dream` | Introspection: find the most similar memory pairs, suggest what to resolve / digest |
+| `extmcp_dream` | Introspection: find the most similar pair among the last `window` rows (2-40, default 10) above `min_sim` (default 0.5), suggest what to resolve / digest; skips pairs already linked via `same_event`/`supersedes` |
 | `extmcp_grow` | Split a journal / long text into 2-6 standalone memories |
-| `extmcp_breath` | Active recall: surface high-weight unresolved memories + pinned cores, 0.3-discounted activation, 6h dedup |
+| `extmcp_breath` | Active recall: surface high-weight unresolved memories + pinned cores, 0.3-discounted activation, 6h dedup; excludes non-main `same_event` members and superseded rows (pinned exempt) |
 | `extmcp_recall_session` | Pull the full memory timeline of one session by `session_id` |
 | `extmcp_session_preview` | Peek at the last few messages of recent conversations |
 | `extmcp_send_to_backend` | Leave a message in the backend inbox; `urgent=true` requests express delivery (the agent's injector polls every 30s and types it straight into the agent's chat) |
-| `extmcp_get_memory` | Direct lookup by `id` / exact `key` / `key_prefix` — straight SQL, bypasses semantic search and does **not** activate |
+| `extmcp_get_memory` | Direct lookup by `id` / exact `key` / `key_prefix` — straight SQL, bypasses semantic search and does **not** activate. Now also returns `relations` (`main` / `same_event_members` / `supersedes` / `superseded_by`) |
 | `extmcp_set_tier` | Explicit promote / demote: set a memory's `tier` (+ optional `until_days` for watch expiry) |
 
 ## Memory tiers
@@ -74,6 +80,22 @@ Every memory carries a `tier` column (plus `tier_until`) placing it in the layer
 | `seabed` | Seabed — the April bulk import | **Never enters breath**, still retrievable (promote with `set_tier`) |
 
 To promote (e.g. seabed → active) or demote / close out, use `extmcp_set_tier`. To look up an exposed memory by its breath id or key without perturbing activation, use `extmcp_get_memory`.
+
+## Relations & due dates
+
+A side table, `memory_relations`, links memories with two edge types:
+
+- **`same_event`**: the source is a member of the event whose main record is the target. Joining a group that's itself a member flattens to the group's root (one level only) — a member always points straight at the true main.
+- **`supersedes`**: the source is the newer record that replaces the target. The old record is *not* auto-resolved — decide separately whether to close it out.
+
+Set links inline via `extmcp_save_memory`'s `same_event_of` / `supersedes` params (link errors land in `note` and never fail the save), or manage them after the fact with `extmcp_link_memory` (self-links and cycles are rejected). `extmcp_get_memory` reports a memory's full relation set (`main`, `same_event_members`, `supersedes`, `superseded_by`).
+
+Effects elsewhere:
+- **`extmcp_breath`**: the PINNED / CORE / WORKING / WATCH / TOP segments skip non-main `same_event` members and superseded rows (pinned rows are exempt from exclusion either way).
+- **`extmcp_search_memory`**: a `same_event` group collapses into one hit (the main record, carrying `same_event_ids` / `same_event_count` / `matched_via`); a superseded row is dropped when its successor also matched, otherwise kept with `superseded_by`.
+- **`extmcp_dream`**: pairs already linked (including same-group siblings) are skipped, so it won't keep re-suggesting a merge you already made.
+
+**`next_due`** (on `extmcp_save_memory` / `extmcp_quicksave`) is an optional due date — `''` | `YYYY-MM-DD` | `YYYY-MM-DDTHH:MM`, Toronto local time, no timezone suffix; an invalid format is rejected and nothing is saved. It mainly matters for `tier='working'` rows: the WORKING breath segment sorts nearest-due first (falling back to update time when unset), and each line is tagged `〔到期 MM-DD〕` or `〔已过期 N 天〕`. A row overdue by more than `NEXT_DUE_OVERDUE_GRACE_DAYS` (default 7) loses its due-sorted slot, falls back to plain update-time order, and gets flagged `疑似已完成未销账，请核对` (looks done but never closed out — please check). Each WORKING row's body is also truncated per path: `BREATH_WORKING_ROW_CHARS` (default 300) on the token-budgeted `extmcp_breath` tool call, `BREATH_WORKING_ROW_CHARS_FULL` (default 0 = no cap) on the unlimited `/breath-hook` and injector paths — pull the full text with `extmcp_get_memory`.
 
 ## HTTP endpoints
 
@@ -185,8 +207,16 @@ The `/breath-hook` endpoint itself is **read-only** and never activates memories
 | `OPENROUTER_MODEL` | cloud-parse model | `google/gemini-3.5-flash-lite` |
 | `DECAY_LAMBDA` | decay coefficient | `0.05` |
 | `DECAY_THRESHOLD` | decay threshold | `0.3` |
+| `EVENT_FRESH_DAYS` | ordinary-tier `event` rows keep full decay weight for this many days after `created_at` | `7` |
+| `EVENT_HALF_DAYS` | after that, weight decays as `exp(-(age-fresh)/EVENT_HALF_DAYS)` | `10` |
+| `EVENT_FLOOR` | floor the above decay never drops below | `0.2` |
+| `NEXT_DUE_OVERDUE_GRACE_DAYS` | days a `next_due` row can be overdue before WORKING breath ordering falls back to update-time order (see [Relations & due dates](#relations--due-dates)) | `7` |
 | `BREATH_TOKEN_BUDGET` | breath output length budget | `3000` |
 | `BREATH_PINNED_QUOTA` | pinned quota within breath | `2` |
+| `BREATH_WORKING_ROW_CHARS` | per-row truncation for WORKING lines on the token-budgeted `extmcp_breath` path | `300` |
+| `BREATH_WORKING_ROW_CHARS_FULL` | same, on the unlimited `/breath-hook` / injector path (`0` = no cap) | `0` |
+
+`.env` (next to `memory.db`, or next to `memory_mcp.py`) is now loaded **before** these module-level constants are read, so any of the above can live in `.env` instead of the process environment; an already-set process env var still wins.
 
 ### One `.env` for all three LLM paths
 
@@ -218,13 +248,17 @@ The cloud-parse path (session consolidation / extraction) auto-fails-over betwee
 Key columns of the `memories` table:
 
 - Content: `id`, `key`, `content`, `category`, `importance`, `session_id`
-- Time: `created_at`, `updated_at`, `last_active`, `last_breath_at`
+- Time: `created_at`, `updated_at`, `last_active`, `last_breath_at`, `next_due` (see [Relations & due dates](#relations--due-dates))
 - Emotion: `valence` (0-1), `arousal` (0-1)
 - Lifecycle: `pinned`, `resolved`, `digested`
 - Retrieval: `embedding` (BLOB, qwen3-embedding:4b 2560-dim float32)
 - Activation: `activation_count` (REAL, bumped on retrieval/breath)
 
+`category` is a free string; besides the original set it now also carries `nudge` / `feedback` / `knowledge` by convention (nothing server-side rejects other values).
+
 `memories_fts` is an FTS5 virtual table auto-maintaining the keyword index over `key + content`.
+
+`memory_relations` is the `same_event` / `supersedes` link table (`src_id`, `dst_id`, `rel`) — see [Relations & due dates](#relations--due-dates).
 
 Companion tables for the agent side: `phone_status` (latest-N snapshots), `phone_events` (rolling 500), `backend_inbox` (`status` × `priority`, urgent rows are express-delivered by the agent's injector). Screenshots live on disk under `peeks/`, not in the DB.
 
@@ -243,6 +277,8 @@ The decay score formula lives in `_calc_decay_score()` in [memory_mcp.py](memory
 - 保存、搜索、列出、删除记忆条目
 - BM25 关键词搜索 + qwen3-embedding:4b 向量余弦相似度融合排序
 - Ebbinghaus 衰减公式 + 情感唤醒度加权
+- `same_event` / `supersedes` 关系把重复或已过时的记录从 breath、search、dream 里折叠掉
+- 工作记忆可挂 `next_due` 到期日，breath 里按到期排序曝光
 - 通过本地 Ollama 模型生成中文摘要 / 情感分析 / 记忆提取
 - 支持 stdio（Claude Desktop）和 Streamable HTTP（手机远程访问）两种传输
 - 拖拽式 Web UI 导入对话记录，自动按格式（Claude 官方 / 插件 / ChatGPT mapping）切换处理模式
@@ -275,21 +311,25 @@ python memory_mcp.py --http --port 3456 --db ./memory.db
 
 ## MCP 工具列表
 
+> 新增/改动工具后 claude.ai 侧不会自动更新——connector 缓存了工具列表，更新后要去 Settings → Connectors 断开重连才能看到新工具。
+
 | 工具 | 说明 |
 |---|---|
-| `extmcp_save_memory` | 保存/更新记忆，自动后台生成 embedding + 情感分析。**2026-07-30 起带 `id` 的更新是部分更新**：没传的字段保留原值——`category` / `importance` / `valence` / `arousal` / `pinned` / `resolved` / `digested` / `session_id` / `activation_count` 不再被重置成默认值，embedding 只在正文真的变了时才重算 |
-| `extmcp_search_memory` | 关键词 + 向量混合搜索（命中后激活 activation_count） |
+| `extmcp_save_memory` | 保存/更新记忆，自动后台生成 embedding + 情感分析。**2026-07-30 起带 `id` 的更新是部分更新**：没传的字段保留原值——`category` / `importance` / `valence` / `arousal` / `pinned` / `resolved` / `digested` / `session_id` / `activation_count` 不再被重置成默认值，embedding 只在正文真的变了时才重算。新增：`append`（原子追加 `content` 到正文末尾并重新 embedding）、`session_id`、`next_due`（到期日，见下方「记忆关系与到期日」）、`same_event_of` / `supersedes`（保存时顺带建关系，出错写进 `note`，不影响保存本身）。返回值新增 `content_preview`、`content_len`、`next_due`。`category` 枚举也接受 `nudge` / `feedback` / `knowledge`（服务端不校验，任意字符串都会被存下） |
+| `extmcp_quicksave` | 最快的速记方式：只需要 `content`，key 取第一行非空文本（截到 50 字）。走和 `extmcp_save_memory` 一样的建档路径 |
+| `extmcp_link_memory` | 给两条已有记忆加/删一条类型化关系（`rel` 取 `same_event` 或 `supersedes`；`remove=true` 删边）。见下方「记忆关系与到期日」 |
+| `extmcp_search_memory` | 关键词 + 向量混合搜索（命中后激活 activation_count）；会折叠有关系的行——同一 `same_event` 组只返回一条主记录（带 `same_event_ids` / `same_event_count`），被取代的旧记录如果继任者也命中就被丢弃，否则保留并标 `superseded_by` |
 | `extmcp_list_memories` | 按更新时间倒序列出 |
 | `extmcp_delete_memory` | 删除一条 |
 | `extmcp_summarize_recent` | 生成最近 N 条记忆的中文摘要（`limit` 1-30，默认 10），同时激活引用记忆 |
 | `extmcp_random_memories` | 随机抽取 4-10 条 |
-| `extmcp_dream` | 自省，找出最相似的记忆对，提示该 resolve / digest 哪些 |
+| `extmcp_dream` | 自省，在最近更新的 `window` 条（2-40，默认 10）里找出相似度超过 `min_sim`（默认 0.5）的最相似记忆对，提示该 resolve / digest 哪些；已经关联过（含同组兄弟）的对会跳过 |
 | `extmcp_grow` | 把日记 / 长文拆成 2-6 条独立记忆 |
-| `extmcp_breath` | 主动呼吸：浮现高权重未解决记忆 + pinned 核心，按 0.3 折扣激活，6h 内同一条不重复 |
+| `extmcp_breath` | 主动呼吸：浮现高权重未解决记忆 + pinned 核心，按 0.3 折扣激活，6h 内同一条不重复；同事件的非主条与已被取代的旧条不曝光（pinned 条目不受此限制） |
 | `extmcp_recall_session` | 按 `session_id` 拉出该会话的完整记忆时间轴 |
 | `extmcp_session_preview` | 速览最近几个对话的最后几条消息 |
 | `extmcp_send_to_backend` | 给后台收件箱留言；`urgent=true` 请求即时投递（agent 的注入器每 30 秒轮询，直接打进 agent 的对话流） |
-| `extmcp_get_memory` | 按 `id` / 精确 `key` / `key_prefix` 直查——走 SQL，绕开语义检索，且**不激活** activation |
+| `extmcp_get_memory` | 按 `id` / 精确 `key` / `key_prefix` 直查——走 SQL，绕开语义检索，且**不激活** activation。现在还会返回 `relations`（`main` / `same_event_members` / `supersedes` / `superseded_by`） |
 | `extmcp_set_tier` | 显式升 / 降层（promote / demote）：设置记忆的 `tier`（+ 可选 `until_days` 给 watch 设到期） |
 
 ## 记忆分层（tier）
@@ -306,6 +346,22 @@ python memory_mcp.py --http --port 3456 --db ./memory.db
 | `seabed` | 海床（4 月批量导入） | **永不进 breath**，检索仍可达（用 `set_tier` 捞珠升层） |
 
 升层（如 seabed → 活跃层）或降层 / 结案，用 `extmcp_set_tier`；想按 breath 里的 id 或 key 核对某条而不扰动 activation，用 `extmcp_get_memory`。
+
+## 记忆关系与到期日
+
+侧表 `memory_relations` 给记忆之间挂两种关系：
+
+- **`same_event`**：源记录是目标记录所在事件的成员。如果目标本身也是别的组的成员，会被拉平指到那个组的根（只拉平一层）——成员永远直接指向真正的主条。
+- **`supersedes`**：源记录是取代目标记录的新条目。旧记录**不会**被自动 resolve，要不要结案单独判断。
+
+关系可以在保存时顺带建（`extmcp_save_memory` 的 `same_event_of` / `supersedes` 参数，出错写进 `note`、不影响保存本身），也可以事后用 `extmcp_link_memory` 单独维护（自连和成环会被拒绝）。`extmcp_get_memory` 会带上某条记忆的完整关系集（`main`、`same_event_members`、`supersedes`、`superseded_by`）。
+
+对其他环节的影响：
+- **`extmcp_breath`**：PINNED / CORE / WORKING / WATCH / TOP 各段都跳过同事件的非主条与已被取代的旧条（pinned 条目两边都不受此限制）。
+- **`extmcp_search_memory`**：同一 `same_event` 组只返回一条（主记录，附 `same_event_ids` / `same_event_count` / `matched_via`）；被取代的旧记录如果继任者也命中就丢弃，否则保留并标 `superseded_by`。
+- **`extmcp_dream`**：已经关联过的对（含同组兄弟）会跳过，不会反复提示合并已经处理过的记录。
+
+`next_due`（`extmcp_save_memory` / `extmcp_quicksave` 都能传）是可选到期日——`''` | `YYYY-MM-DD` | `YYYY-MM-DDTHH:MM`，多伦多本地时间，不带时区后缀；格式不对会直接拒绝，不落库。它主要影响 `tier='working'` 的行：WORKING 段按到期日由近到远排序（没设到期日的按更新时间排在后面），行尾标〔到期 MM-DD〕或〔已过期 N 天〕。过期超过 `NEXT_DUE_OVERDUE_GRACE_DAYS`（默认 7 天）的行会掉出按到期排序的位置、回落到按更新时间排，并标注「疑似已完成未销账，请核对」。每条 WORKING 正文还会按路径截断：`BREATH_WORKING_ROW_CHARS`（默认 300，走带预算的 `extmcp_breath` 工具调用）或 `BREATH_WORKING_ROW_CHARS_FULL`（默认 0 = 不截断，走不设预算的 `/breath-hook` 与注入器路径）——要全文用 `extmcp_get_memory`。
 
 ## HTTP 端点
 
@@ -417,8 +473,16 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 | `OPENROUTER_MODEL` | 云端解析模型 | `google/gemini-3.5-flash-lite` |
 | `DECAY_LAMBDA` | 衰减系数 | `0.05` |
 | `DECAY_THRESHOLD` | 衰减阈值 | `0.3` |
+| `EVENT_FRESH_DAYS` | 普通层 `event` 记录建档后这么多天内保持满权重 | `7` |
+| `EVENT_HALF_DAYS` | 超过之后按 `exp(-(建档天数-EVENT_FRESH_DAYS)/EVENT_HALF_DAYS)` 衰减 | `10` |
+| `EVENT_FLOOR` | 上述衰减的下限 | `0.2` |
+| `NEXT_DUE_OVERDUE_GRACE_DAYS` | `next_due` 行过期多少天后 WORKING breath 排序回落到按更新时间（见上方「记忆关系与到期日」） | `7` |
 | `BREATH_TOKEN_BUDGET` | breath 输出字数预算 | `3000` |
 | `BREATH_PINNED_QUOTA` | breath 中 pinned 配额 | `2` |
+| `BREATH_WORKING_ROW_CHARS` | 带预算的 `extmcp_breath` 路径下 WORKING 每行截断字数 | `300` |
+| `BREATH_WORKING_ROW_CHARS_FULL` | 不设预算的 `/breath-hook` / 注入器路径下同上（`0` = 不截断） | `0` |
+
+`.env`（放 `memory.db` 旁边或 `memory_mcp.py` 旁边）现在会在读取上面这些模块级常数**之前**加载，所以它们都可以写进 `.env`；进程环境变量如果已经设了则优先级更高。
 
 ### 一个 `.env` 管三条 LLM 链路
 
@@ -450,13 +514,17 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 `memories` 表关键字段：
 
 - 内容：`id`, `key`, `content`, `category`, `importance`, `session_id`
-- 时间：`created_at`, `updated_at`, `last_active`, `last_breath_at`
+- 时间：`created_at`, `updated_at`, `last_active`, `last_breath_at`, `next_due`（见上方「记忆关系与到期日」）
 - 情感：`valence` (0-1), `arousal` (0-1)
 - 生命周期：`pinned`, `resolved`, `digested`
 - 检索：`embedding` (BLOB, qwen3-embedding:4b 2560 维 float32)
 - 激活：`activation_count` (REAL, 被检索/呼吸时累加)
 
+`category` 是自由字符串；除了原来那套，现在按约定也会写 `nudge` / `feedback` / `knowledge`（服务端不做任何拦截）。
+
 `memories_fts` 是 FTS5 虚表，自动维护 `key + content` 的关键词索引。
+
+`memory_relations` 是 `same_event` / `supersedes` 的关系表（`src_id`, `dst_id`, `rel`）——见上方「记忆关系与到期日」。
 
 agent 侧的伴生表：`phone_status`（近 N 条快照）、`phone_events`（滚动 500 行）、`backend_inbox`（`status` × `priority`，urgent 行由 agent 的注入器即时投递）。截图存磁盘 `peeks/` 目录，不进库。
 
