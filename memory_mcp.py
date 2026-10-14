@@ -9,6 +9,7 @@ Default database path: ./memory.db
 
 from __future__ import annotations
 
+import contextvars
 import json
 import math
 import os
@@ -649,6 +650,68 @@ BREATH_PINNED_QUOTA = int(os.environ.get("BREATH_PINNED_QUOTA", "2"))
 # seabed   海床：批量导入的低价值碎片，永不主动浮现
 VALID_TIERS = frozenset({"", "working", "watch", "core", "archive", "seabed"})
 
+# ---- author (who WROTE the entry — the writer, not whose experience it is) ----
+# Short free-form tag, e.g. o55 / f51 / o46 / f5 / s55 / h55. Unknown tags are
+# accepted (future models will appear); normalisation only strips, lowercases,
+# drops characters that would break the bracketed display formats, and caps the
+# length. Old rows stay NULL forever — nothing is ever inferred from key text.
+AUTHOR_MAX_LEN = 16
+_AUTHOR_BAD_CHARS = frozenset("[]|,:\"'`<>")
+# Per-request default set by the HTTP transport from the X-Memory-Author
+# header (or ?author= query). A ContextVar rather than a global because the
+# HTTP server is threaded and shared by many sessions at once.
+_REQUEST_AUTHOR: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "memory_request_author", default=""
+)
+
+
+def _normalize_author(value: Any) -> str:
+    """'  O55 ' → 'o55'; None / '' / junk-only → ''. Never raises."""
+    # Only scalar tags make sense; a dict/list/bool would be str()-mangled into
+    # junk like '{x1}' or 'true'.
+    if value is None or isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return ""
+    # An unexpanded client-side `${MEMORY_AUTHOR}` header arrives literally;
+    # treat it as "no author" instead of storing a junk tag.
+    if "${" in str(value):
+        return ""
+    s = "".join(
+        ch for ch in str(value).strip().lower()
+        if not ch.isspace() and ch not in _AUTHOR_BAD_CHARS
+    )
+    return s[:AUTHOR_MAX_LEN]
+
+
+def _default_author() -> str:
+    """Author used when a write call omits `author`: request header (HTTP) →
+    MEMORY_AUTHOR env var (mainly for stdio) → '' (stored as NULL)."""
+    return (
+        _normalize_author(_REQUEST_AUTHOR.get())
+        or _normalize_author(os.environ.get("MEMORY_AUTHOR"))
+    )
+
+
+def _explicit_author(args: dict[str, Any]) -> str:
+    """Normalised `author` argument if the caller sent a non-empty one, else ''."""
+    if "author" not in args or args["author"] is None:
+        return ""
+    return _normalize_author(args["author"])
+
+
+def _parse_author_filter(value: Any) -> list[str] | None:
+    """'o55' / 'o55,f51' / ['o55','f51'] → ['o55','f51']; empty → None (no filter)."""
+    if value is None:
+        return None
+    raw = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    out = [a for a in (_normalize_author(x) for x in raw) if a]
+    return list(dict.fromkeys(out)) or None
+
+
+def _author_tag(rec: Any) -> str:
+    """'[o55] ' for display, '' when the row has no author."""
+    a = getattr(rec, "author", "") or ""
+    return f"[{a}] " if a else ""
+
 # ---- memory_relations (typed edges; see MemoryStore.add_relation) ----
 RELATION_TYPES = frozenset({"same_event", "supersedes"})
 RELATION_MAX_HOPS = 5
@@ -1013,8 +1076,11 @@ def _compose_breath_output(
                 f"{flat[:body_cap]}…〔截断，全文 {len(flat)} 字，"
                 f"extmcp_get_memory 取全文〕"
             )
+        # Author tag sits AFTER the [id:...] bracket on purpose: nudge_inject.py
+        # parses ids with ^\[id:([^\]]+)\], so folding it inside would corrupt
+        # every id it extracts. Rows without an author render exactly as before.
         return (
-            f"[id:{rec.id}] [weight:{weight_str} "
+            f"[id:{rec.id}] {_author_tag(rec)}[weight:{weight_str} "
             f"V{rec.valence:.1f}/A{rec.arousal:.1f}] {flat_key}: {flat}"
         )
 
@@ -1520,8 +1586,9 @@ def _compose_associate_output(
     lines = []
     for rec in picked:
         stamp = (rec.created_at or "")[:7] or "?"
+        who = f"{rec.author}|" if rec.author else ""
         lines.append(
-            f"[联想|id:{rec.id}|{stamp}] "
+            f"[联想|{who}id:{rec.id}|{stamp}] "
             f"{_associate_flatten(rec.key, 60)}: {_associate_flatten(rec.content)}"
         )
     return "\n".join(lines)
@@ -1771,6 +1838,7 @@ class MemoryRecord:
     tier: str = ""
     tier_until: str = ""
     next_due: str = ""          # '' | YYYY-MM-DD | YYYY-MM-DDTHH:MM (Toronto local)
+    author: str = ""            # writer tag; '' ⇔ NULL in the db
     final_score: float = 0.0
     vector_score: float = 0.0
     keyword_score: float = 0.0
@@ -1868,6 +1936,7 @@ class MemoryStore:
                 ("tier",             "TEXT DEFAULT ''"),   # layered-memory tier (see VALID_TIERS)
                 ("tier_until",       "TEXT DEFAULT ''"),   # watch-tier expiry (UTC ISO); empty = no expiry
                 ("next_due",         "TEXT DEFAULT ''"),   # '' | YYYY-MM-DD | YYYY-MM-DDTHH:MM, Toronto local
+                ("author",           "TEXT"),              # writer tag (o55/f51/...); NULL = unknown, never backfilled
             ]
             for col_name, col_def in _NEW_COLS:
                 if col_name not in columns:
@@ -2223,7 +2292,11 @@ class MemoryStore:
         digested: bool = False,
         activation_count: float = 1.0,
         last_active: str = "",
+        author: str | None = None,
     ) -> MemoryRecord:
+        """Insert or fully rewrite a row. `author` is written on INSERT only:
+        the ON CONFLICT branch deliberately leaves it alone, so a rewrite never
+        re-attributes an existing entry ('' / None → NULL)."""
         if pinned:
             importance = 1.0
         now = datetime.now(timezone.utc).isoformat()
@@ -2235,8 +2308,9 @@ class MemoryStore:
                 """
             INSERT INTO memories(id,key,content,memory_kind,category,importance,session_id,
                                  created_at,updated_at,embedding,
-                                 valence,arousal,pinned,resolved,digested,activation_count,last_active)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                 valence,arousal,pinned,resolved,digested,activation_count,last_active,
+                                 author)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
               key=excluded.key, content=excluded.content, memory_kind=excluded.memory_kind,
               category=excluded.category, importance=excluded.importance,
@@ -2253,6 +2327,7 @@ class MemoryStore:
                     _pack_embedding(embedding or []),
                     valence, arousal, int(pinned), int(resolved), int(digested),
                     activation_count, last_active or now,
+                    (author or None),
                 ),
             )
             self.conn.commit()
@@ -2567,6 +2642,7 @@ class MemoryStore:
         limit: int = 50,
         memory_kind: str = "long_term",
         tier: Optional[str] = None,
+        authors: list[str] | None = None,
     ) -> List[MemoryRecord]:
         # digested rows are archived merge-source fragments — they exist for
         # audit/recall_session but should not surface in normal listings.
@@ -2575,6 +2651,9 @@ class MemoryStore:
         if tier is not None:
             sql += " AND COALESCE(tier,'') = ?"
             params.append(tier)
+        if authors:
+            sql += " AND author IN ({})".format(",".join("?" * len(authors)))
+            params.extend(authors)
         sql += " ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -2596,8 +2675,12 @@ class MemoryStore:
         query_embedding: Optional[List[float]] = None,
         limit: int = 8,
         memory_kind: str = "long_term",
+        authors: list[str] | None = None,
     ) -> List[MemoryRecord]:
         """Hybrid BM25 + vector cosine search with relative-threshold + MMR.
+
+        `authors` (optional) restricts every candidate source to rows whose
+        author is in the list; None = no filter (the default everywhere).
 
         Pipeline:
           1. FTS5 BM25 keyword hits (+ LIKE fallback)
@@ -2611,6 +2694,11 @@ class MemoryStore:
         timing: Dict[str, float] = {}
         fallback_limit = max(limit * 6, 24)
         tokens = [t.strip() for t in query.replace("\uff0c", " ").replace(",", " ").split() if t.strip()]
+        if authors:
+            _auth_sql = " AND author IN ({})".format(",".join("?" * len(authors)))
+            _auth_params: tuple = tuple(authors)
+        else:
+            _auth_sql, _auth_params = "", ()
 
         # ---- 1. Keyword (BM25) ----
         t0 = _time_mod.monotonic()
@@ -2622,9 +2710,11 @@ class MemoryStore:
                     FROM memories_fts
                     JOIN memories m ON m.rowid = memories_fts.rowid
                     WHERE memories_fts MATCH ? AND m.memory_kind = ? AND m.digested = 0
+                    """ + _auth_sql.replace("author", "m.author") + """
                     ORDER BY keyword_score LIMIT ?
                     """,
-                    (" OR ".join(dict.fromkeys(tokens)) or query, memory_kind, fallback_limit),
+                    (" OR ".join(dict.fromkeys(tokens)) or query, memory_kind,
+                     *_auth_params, fallback_limit),
                 ).fetchall()
         except sqlite3.Error:
             keyword_rows = []
@@ -2636,10 +2726,11 @@ class MemoryStore:
                 like_clauses.append("key LIKE ? OR content LIKE ?")
                 params.extend([f"%{token}%", f"%{token}%"])
             where = " OR ".join(f"({c})" for c in like_clauses)
+            params.extend(_auth_params)
             params.append(fallback_limit)
             with self._lock:
                 keyword_rows = self.conn.execute(
-                    f"SELECT *, 0.5 AS keyword_score FROM memories WHERE memory_kind = ? AND digested = 0 AND ({where}) ORDER BY updated_at DESC LIMIT ?",
+                    f"SELECT *, 0.5 AS keyword_score FROM memories WHERE memory_kind = ? AND digested = 0 AND ({where}){_auth_sql} ORDER BY updated_at DESC LIMIT ?",
                     tuple(params),
                 ).fetchall()
 
@@ -2664,14 +2755,18 @@ class MemoryStore:
         vector_hits: list[MemoryRecord] = []
         if query_embedding:
             top_k = max(limit * MMR_POOL_MULT, 20)
+            if authors:
+                # The vector index is author-blind; widen the net so the SQL
+                # filter below still has enough survivors to rank.
+                top_k = min(max(top_k * 10, 400), 2000)
             id_scores = self._vector_search(query_embedding, top_k=top_k)
             if id_scores:
                 id_to_score = {mid: score for mid, score in id_scores}
                 placeholders = ",".join("?" * len(id_to_score))
                 with self._lock:
                     rows = self.conn.execute(
-                        f"SELECT * FROM memories WHERE id IN ({placeholders}) AND memory_kind = ?",
-                        (*id_to_score.keys(), memory_kind),
+                        f"SELECT * FROM memories WHERE id IN ({placeholders}) AND memory_kind = ?{_auth_sql}",
+                        (*id_to_score.keys(), memory_kind, *_auth_params),
                     ).fetchall()
                 for r in rows:
                     s = id_to_score.get(r["id"], 0.0)
@@ -2795,6 +2890,7 @@ class MemoryStore:
             tier=str(_get("tier", "") or ""),
             tier_until=str(_get("tier_until", "") or ""),
             next_due=str(_get("next_due", "") or ""),
+            author=str(_get("author", "") or ""),
         )
 
 
@@ -3581,11 +3677,24 @@ TOOLS = [
             "Optional `tier` places the memory in the layered-memory architecture "
             "(working/watch/core/archive/seabed; '' = ordinary). On update, an omitted `tier` "
             "keeps the existing tier. Passing resolved=true on a `working` memory auto-archives "
-            "it (tier→archive)."
+            "it (tier→archive). Optional `author` tags who wrote the entry (see the param); "
+            "on update an omitted author keeps the stored one."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "author": {
+                    "type": "string",
+                    "description": (
+                        "Who WROTE this entry (the writer, not whose experience it "
+                        "records): a short model tag such as o55 (Opus 5.5), f51 (Fable "
+                        "5.1), o46, f5, s55, h55. Lowercased, max 16 chars; unknown tags "
+                        "are accepted. "
+                        "Omitted on create → the X-Memory-Author request header, else the "
+                        "MEMORY_AUTHOR env var, else none. On update only an explicit value "
+                        "changes it (the header/env default never re-attributes an old row)."
+                    ),
+                },
                 "key": {
                     "type": "string",
                     "description": "Short title or label. Required on create; omit on update to keep.",
@@ -3722,6 +3831,16 @@ TOOLS = [
                     "description": "Layered-memory tier (default '' = ordinary)",
                 },
                 "session_id": {"type": "string", "description": "Optional session/group label"},
+                "author": {
+                    "type": "string",
+                    "description": (
+                        "Who WROTE this entry (the writer, not whose experience it "
+                        "records): a short model tag such as o55 (Opus 5.5), f51 (Fable "
+                        "5.1), o46, f5, s55, h55. Lowercased, max 16 chars; unknown tags "
+                        "are accepted. "
+                        "Omitted → X-Memory-Author header, else MEMORY_AUTHOR env, else none."
+                    ),
+                },
             },
             "required": ["content"],
         },
@@ -3770,6 +3889,14 @@ TOOLS = [
                     "type": "integer",
                     "description": "Max results, 1-40 (default 8). Caller decides based on task scope.",
                 },
+                "author": {
+                    "type": "string",
+                    "description": (
+                        "Optional: only return entries written by this author tag, or any of "
+                        "a comma list ('o55,f51'). Rows with no recorded author never match. "
+                        "Omit for no filter (default)."
+                    ),
+                },
             },
             "required": ["query"],
         },
@@ -3795,6 +3922,10 @@ TOOLS = [
                     "type": "string",
                     "enum": ["", "working", "watch", "core", "archive", "seabed"],
                     "description": "Optional: only list memories in this tier ('' = ordinary/untiered).",
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Optional: only list entries by this author tag or comma list ('o55,f51').",
                 },
             },
         },
@@ -3942,6 +4073,13 @@ TOOLS = [
             "properties": {
                 "content": {"type": "string", "description": "Diary entry or long text to split and store"},
                 "session_id": {"type": "string", "description": "Optional session ID"},
+                "author": {
+                    "type": "string",
+                    "description": (
+                        "Optional writer tag stamped on every record created (e.g. o55). "
+                        "Omitted → X-Memory-Author header, else MEMORY_AUTHOR env, else none."
+                    ),
+                },
             },
             "required": ["content"],
         },
@@ -4171,6 +4309,7 @@ def _create_memory_record(
     session_id: str = "",
     next_due: str = "",
     tier: str | None = None,
+    author: str = "",
 ) -> tuple:
     """Create one memory row the way extmcp_save_memory always has: full
     upsert with defaults, optional next_due / tier narrow writes, then a bg
@@ -4187,6 +4326,7 @@ def _create_memory_record(
         pinned=pinned, resolved=resolved, digested=digested,
         valence=0.5 if valence is None else valence,
         arousal=0.3 if arousal is None else arousal,
+        author=author or None,
     )
     if next_due:
         with store._lock:
@@ -4236,6 +4376,7 @@ def _save_result(rec: MemoryRecord, final_tier: str, final_until: str,
         "pinned": rec.pinned, "resolved": rec.resolved,
         "tier": final_tier, "tier_until": final_until,
         "next_due": rec.next_due, "session_id": rec.session_id,
+        "author": rec.author or None,
         "decay_score": _calc_decay_score(rec),
         "content_preview": _content_preview(rec.content),
         "content_len": len(rec.content or ""),
@@ -4415,6 +4556,13 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 fields["session_id"] = str(args["session_id"]).strip()
             if next_due_given:
                 fields["next_due"] = next_due_val
+            # Author on update: only an explicit, non-empty `author` changes it.
+            # The header/env default is NOT applied here — whoever resolves or
+            # appends to an entry is not its writer, and stamping old NULL rows
+            # on touch would be exactly the backfill-by-guessing we rule out.
+            explicit_author = _explicit_author(args)
+            if explicit_author:
+                fields["author"] = explicit_author
             # Same invariant upsert_memory enforces: a pinned memory is max-important.
             final_pinned = (
                 bool(args["pinned"]) if _given("pinned") else existing_rec.pinned
@@ -4485,6 +4633,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 ),
                 next_due=next_due_val,
                 tier=user_tier,
+                author=_explicit_author(args) or _default_author(),
             )
             final_tier = meta["tier"]
             final_until = meta["tier_until"]
@@ -4547,6 +4696,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             importance=importance,
             session_id=str(args.get("session_id", "") or "").strip(),
             tier=user_tier or None,
+            author=_explicit_author(args) or _default_author(),
         )
         note = (
             " & ".join(meta["bg_parts"]) + " running in background"
@@ -4584,11 +4734,13 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         if not query:
             raise ValueError("query is required")
         limit = max(1, min(40, int(args.get("limit", 8) or 8)))
+        author_filter = _parse_author_filter(args.get("author"))
         query_embedding = _call_ollama_embedding(query) or None
         # Over-fetch so folding (same_event groups collapse to one item,
         # superseded rows drop out) can still return `limit` items.
         fetch_n = min(80, limit * 2)
-        results = store.search(query, query_embedding=query_embedding, limit=fetch_n)
+        results = store.search(query, query_embedding=query_embedding,
+                               limit=fetch_n, authors=author_filter)
         folded = _fold_search_results(store, results)[:limit]
 
         # Touch only rows that actually matched and are represented in the
@@ -4615,6 +4767,8 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 "next_due": r.next_due,
                 "decay_score": _calc_decay_score(r),
             }
+            if r.author:
+                item["author"] = r.author
             if g["members"]:
                 item["same_event_ids"] = list(g["members"])
                 item["same_event_count"] = len(g["members"])
@@ -4636,7 +4790,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 bucket["hit_count"] += 1
                 bucket["ids"].append(r.id)
         multi_hit = {k: v for k, v in session_agg.items() if v["hit_count"] >= 2}
-        return [{"type": "text", "text": json.dumps({
+        out_payload: dict[str, Any] = {
             "query": query,
             "count": len(items),
             "items": items,
@@ -4646,7 +4800,12 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 "用 extmcp_recall_session(session_id) 可以拉出完整时间轴。"
                 if multi_hit else ""
             ),
-        }, ensure_ascii=False)}]
+        }
+        if author_filter:
+            # Folding may surface a group's main even when only a member matched
+            # the filter; say so rather than silently showing another author.
+            out_payload["author_filter"] = author_filter
+        return [{"type": "text", "text": json.dumps(out_payload, ensure_ascii=False)}]
 
     elif name == "extmcp_list_memories":
         limit = max(1, min(100, int(args.get("limit", 20) or 20)))
@@ -4659,7 +4818,9 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 raise ValueError(
                     f"invalid tier: {tier_filter!r} (valid: {sorted(VALID_TIERS)})"
                 )
-        results = store.list_memories(limit=limit, tier=tier_filter)
+        author_filter = _parse_author_filter(args.get("author"))
+        results = store.list_memories(limit=limit, tier=tier_filter,
+                                      authors=author_filter)
         if full:
             items = [
                 {
@@ -4670,6 +4831,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                     "pinned": r.pinned, "tier": r.tier,
                     "next_due": r.next_due,
                     "decay_score": _calc_decay_score(r),
+                    **({"author": r.author} if r.author else {}),
                 }
                 for r in results
             ]
@@ -4683,12 +4845,15 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                     "decay_score": _calc_decay_score(r),
                     "pinned": r.pinned, "tier": r.tier,
                     "next_due": r.next_due,
+                    **({"author": r.author} if r.author else {}),
                 }
                 for r in results
             ]
         return [{"type": "text", "text": json.dumps(
             {"count": len(items), "full": full,
-             "tier_filter": tier_filter, "items": items},
+             "tier_filter": tier_filter,
+             **({"author_filter": author_filter} if author_filter else {}),
+             "items": items},
             ensure_ascii=False,
         )}]
 
@@ -4728,6 +4893,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 "valence": r.valence, "arousal": r.arousal,
                 "created_at": r.created_at, "updated_at": r.updated_at,
                 "next_due": r.next_due,
+                "author": r.author or None,
                 "decay_score": _calc_decay_score(r),
                 "relations": store.relations_of(r.id),
             }
@@ -4894,7 +5060,8 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         items = [
             {"id": r.id, "key": r.key, "content": r.content,
              "category": r.category, "importance": r.importance,
-             "tier": r.tier, "updated_at": r.updated_at}
+             "tier": r.tier, "updated_at": r.updated_at,
+             **({"author": r.author} if r.author else {})}
             for r in results
         ]
         payload = {"requested": count, "count": len(items), "items": items}
@@ -5002,7 +5169,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 if mid in rec_map:
                     r = rec_map[mid]
                     lines.append(
-                        f"**{r.key}** id={r.id} "
+                        f"**{r.key}** id={r.id} {_author_tag(r)}"
                         f"[V{r.valence:.2f}/A{r.arousal:.2f} decay={r.decay_score:.4f}]"
                     )
                     lines.append(f"> {r.content[:400]}\n")
@@ -5018,6 +5185,19 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
             lines.append(
                 f"→ 建议: {suggestion} | ids: {best_pair[0]}, {best_pair[1]}\n"
             )
+            # Author signal — annotation only, never an automatic link.
+            if r1 and r2 and r1.author and r2.author:
+                if r1.author != r2.author:
+                    lines.append(
+                        f"> 作者不同（{r1.author} / {r2.author}）：可能是两个循环各记了"
+                        "同一件事 → 若属实，用 extmcp_link_memory(rel='same_event') "
+                        "把非主条挂到主条下。\n"
+                    )
+                else:
+                    lines.append(
+                        f"> 同一作者（{r1.author}）：更像同一写手的重复记录或续写 → "
+                        "考虑合并，或用 supersedes 标出新旧。\n"
+                    )
             lines.append(
                 "> 这两条记忆在语义上紧密相连，可以考虑整合、标记 resolved，"
                 "或用 extmcp_save_memory 写下新的感受。\n"
@@ -5030,7 +5210,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         lines.append("## 所有记忆概览\n")
         for rec in recs:
             lines.append(
-                f"- **[{rec.key}]** id={rec.id} "
+                f"- **[{rec.key}]** id={rec.id} {_author_tag(rec)}"
                 f"V{rec.valence:.2f}/A{rec.arousal:.2f} "
                 f"decay={rec.decay_score:.4f} "
                 f"resolved={rec.resolved} digested={rec.digested}"
@@ -5049,6 +5229,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         if not content:
             raise ValueError("content is required")
         session_id = str(args.get("session_id", "")).strip()
+        grow_author = _explicit_author(args) or _default_author()
 
         if len(content) < 30:
             memory_id = f"mem_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
@@ -5057,6 +5238,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 key=content[:50],
                 content=content,
                 session_id=session_id,
+                author=grow_author or None,
             )
 
             def _bg_short(mid: str, txt: str) -> None:
@@ -5117,6 +5299,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 valence=max(0.0, min(1.0, float(item.get("valence", 0.5)))),
                 arousal=max(0.0, min(1.0, float(item.get("arousal", 0.3)))),
                 session_id=session_id,
+                author=grow_author or None,
             )
             saved_ids.append(memory_id)
 
@@ -5164,6 +5347,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
                 "created_at": r.created_at,
                 "valence": r.valence, "arousal": r.arousal,
                 "pinned": r.pinned, "resolved": r.resolved,
+                **({"author": r.author} if r.author else {}),
             }
             for r in recs
         ]
@@ -5259,8 +5443,15 @@ def _dispatch(
     store: MemoryStore,
     msg: Dict[str, Any],
     client_name: str = "",
+    author: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Process one JSON-RPC message. Returns a response dict, or None for notifications.
+
+    `author` is the transport-level default writer tag for this request (HTTP:
+    X-Memory-Author header / ?author= query). It is exposed to handle_tool via
+    the _REQUEST_AUTHOR ContextVar for the duration of the call only; an
+    explicit `author` tool argument still wins, MEMORY_AUTHOR env is the
+    fallback (see _default_author).
 
     `client_name` is whatever the client called itself at handshake time; it
     only affects which tools get *advertised* (see _visible_tools). Calls are
@@ -5288,6 +5479,7 @@ def _dispatch(
         tool_args = params.get("arguments", {})
         sys.stderr.write(f"[memory-mcp] tools/call: {tool_name} args={tool_args}\n")
         sys.stderr.flush()
+        _author_token = _REQUEST_AUTHOR.set(_normalize_author(author))
         try:
             content = handle_tool(store, tool_name, tool_args)
             sys.stderr.write(f"[memory-mcp] tools/call OK: {tool_name}, content_len={len(json.dumps(content, ensure_ascii=False))}\n")
@@ -5301,6 +5493,8 @@ def _dispatch(
                 "content": [{"type": "text", "text": str(e)}],
                 "isError": True,
             })
+        finally:
+            _REQUEST_AUTHOR.reset(_author_token)
 
     else:
         return _error(request_id, -32601, f"Method not found: {method}")
@@ -5343,6 +5537,17 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
 
     class McpHandler(BaseHTTPRequestHandler):
 
+        def _request_author(self) -> str:
+            """Per-request default writer tag: X-Memory-Author header, else
+            ?author= on the URL (for clients that cannot set headers)."""
+            hdr = self.headers.get("X-Memory-Author", "") or ""
+            if hdr.strip():
+                return _normalize_author(hdr)
+            if "?" in self.path:
+                qs = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+                return _normalize_author((qs.get("author") or [""])[0])
+            return ""
+
         # ---- Streamable HTTP /mcp ----------------------------------------
 
         def _handle_mcp_post(self) -> None:
@@ -5367,12 +5572,13 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
             has_requests = any(m.get("id") is not None for m in messages)
 
             sid = self.headers.get("Mcp-Session-Id", "")
+            req_author = self._request_author()
 
             if not has_requests:
                 with _sessions_lock:
                     client_name = _session_clients.get(sid, "")
                 for m in messages:
-                    _dispatch(store, m, client_name=client_name)
+                    _dispatch(store, m, client_name=client_name, author=req_author)
                 self.send_response(202)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
@@ -5390,7 +5596,8 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                     extra_headers["Mcp-Session-Id"] = sid
                 with _sessions_lock:
                     client_name = _session_clients.get(sid, "")
-                resp = _dispatch(store, m, client_name=client_name)
+                resp = _dispatch(store, m, client_name=client_name,
+                                 author=req_author)
                 if resp is not None:
                     responses.append(resp)
 
@@ -5917,15 +6124,16 @@ def _run_http(store: MemoryStore, host: str, port: int, open_browser: bool = Fal
                 self.wfile.write(b'{"error":"invalid JSON"}')
                 return
 
+            req_author = self._request_author()
             if isinstance(msg, list):
                 results = []
                 for m in msg:
-                    r = _dispatch(store, m)
+                    r = _dispatch(store, m, author=req_author)
                     if r is not None:
                         results.append(r)
                 out = json.dumps(results, ensure_ascii=True).encode("utf-8") if results else b"[]"
             else:
-                resp = _dispatch(store, msg)
+                resp = _dispatch(store, msg, author=req_author)
                 if resp is None:
                     self.send_response(204)
                     self.end_headers()
