@@ -94,6 +94,10 @@ SOURCE_MAX_SHOWN = 8
 LLM_TIMEOUT = 600.0          # seconds per claude call
 LLM_ATTEMPTS = 2             # initial call + one retry
 
+# The layer named in English inside the (English) prompt: "this {unit}", "the {unit}'s digest".
+LAYER_EN = {"day": "day", "week": "week", "halfmonth": "half-month", "month": "month",
+            "quarter": "quarter", "half": "half-year", "year": "year"}
+
 # Layer configuration. `cn` doubles as the key prefix: "[周记] ".
 # `unit` fills "这一{unit}" / "一{unit}"; `ref` fills the "本X" possessive slots
 # ("本周的周记") — kept separate because "本天" is not Chinese.
@@ -227,9 +231,12 @@ class Period:
     def __repr__(self) -> str:
         return f"<Period {self.key} {self.start_s}..{self.end_s}>"
 
-    def local_range_text(self, tz: tzinfo) -> str:
+    def local_range_text(self, tz: tzinfo, english: bool = False) -> str:
         a = self.start_utc.astimezone(tz).date()
         b = (self.end_utc - timedelta(seconds=1)).astimezone(tz).date()
+        if english:
+            return f"{a.isoformat()}, Toronto local time" if a == b else \
+                f"{a.isoformat()} to {b.isoformat()}, Toronto local time"
         if a == b:
             return f"{a.isoformat()}，多伦多本地时间"
         return f"{a.isoformat()} 至 {b.isoformat()}，多伦多本地时间"
@@ -607,7 +614,7 @@ def _local_stamp(created_at: str, tz: tzinfo) -> str:
 
 def _clip(text: str, limit: int) -> str:
     text = (text or "").strip()
-    return text if len(text) <= limit else text[:limit] + "……（本条已截断）"
+    return text if len(text) <= limit else text[:limit] + " … (entry truncated)"
 
 
 def trim_to_budget(items: list[dict], budget: int, entry_limit: int) -> tuple[list[dict], int]:
@@ -647,52 +654,64 @@ def _digest_block(items: list[dict]) -> str:
 
 def build_prompt(period: Period, tz: tzinfo, *, raw_items: list[dict], digest_items: list[dict],
                  dropped: int, entry_limit: int) -> str:
+    """The instructions are in English (the models follow them more steadily); the digest itself is written in
+    Chinese, like the memories it reads."""
     cfg = LAYER_CFG[period.layer]
-    cn, unit, ref, max_chars = cfg["cn"], cfg["unit"], cfg["ref"], cfg["max_chars"]
+    cn, unit, max_chars = cfg["cn"], LAYER_EN[period.layer], cfg["max_chars"]
 
     header = (
-        f"你是一名记忆整理员。下面是 {period.key}（{period.local_range_text(tz)}）"
-        f"这一{unit}的记忆材料，请把它们收拢成一篇{cn}。\n\n"
-        f"### 硬性规则\n"
-        f"1. 只可以提取输入里已经出现过的信息。禁止推断、禁止演绎、禁止补充输入之外的任何说法；"
-        f"材料没写的因果关系不要替它补上。宁可写少，不可编造。\n"
-        f"2. 具体的人名、项目名、地名、日期、数字、专有名词一律照抄保留，不要泛化成「某人」「某个项目」。\n"
-        f"3. 材料互相矛盾时以时间较晚的为准，必要时注明存在分歧。\n"
-        f"4. 输出纯正文。不要 markdown 标题、不要代码块、不要分隔线，不要复述本提示。"
-        f"第一行就是正文第一句：正文前后都不要写开场白、字数统计、「以上是我的输出」之类的交代。\n"
-        f"5. 不要写出任何 mem_ 开头的记忆编号，来源清单由程序另行附加。\n"
-        f"6. 全文中文，使用全角标点，引号一律用「」，总长度不超过 {max_chars} 字。\n\n"
-        f"### 输出结构（三段，段间空一行，不加小标题）\n"
+        f"You are a memory archivist. Below is the memory material for {period.key} "
+        f"({period.local_range_text(tz, english=True)}), one {unit}. Gather it into a single {cn} "
+        f"(the {unit}'s digest).\n\n"
+        "### Hard rules\n"
+        "1. Use only information that already appears in the input. No inference, no extrapolation, nothing from "
+        "outside the input; don't supply causal links the material doesn't state. Writing less beats making "
+        "things up.\n"
+        "2. Copy names of people, projects and places, dates, numbers and proper nouns exactly as written; never "
+        "generalise them into 「某人」 or 「某个项目」.\n"
+        "3. Where the material contradicts itself, the later entry wins; note the disagreement where it matters.\n"
+        "4. Output the body text only: no markdown headings, no code blocks, no horizontal rules, and don't restate "
+        "this prompt. The first line is the digest's first sentence; nothing before or after the body (no "
+        "preamble, no character count, nothing like 「以上是我的输出」).\n"
+        "5. Don't write any memory id beginning with mem_; the program appends the source list itself.\n"
+        f"6. Write the whole digest in Chinese, with full-width punctuation and 「」 for every quotation mark, "
+        f"at most {max_chars} Chinese characters in all.\n\n"
+        "### Output structure (three paragraphs, a blank line between them, no subheadings)\n"
     )
     if period.layer in ("day", "week"):
-        header += (f"第一段：主线叙事。开头第一句先用一句话概括这一{unit}的基调，"
-                   f"然后按时间顺序展开这一{unit}实际发生的事。\n")
+        header += (f"Paragraph 1: the main narrative. Open with one sentence that sums up the tone of this {unit}, "
+                   f"then tell what actually happened during it, in time order.\n")
     else:
-        header += f"第一段：主线叙事。开头第一句先用一句话概括这一{unit}的整体走向，然后展开主要脉络与转折。\n"
+        header += (f"Paragraph 1: the main narrative. Open with one sentence that sums up where this {unit} went "
+                   f"overall, then lay out its main threads and turning points.\n")
     header += (
-        "第二段：关键事实短列，一行一条，行首用「· 」，只放日期、数字、名称、结论这类可以核对的硬信息。\n"
-        "第三段：悬而未决的事项——输入里提出了却没有结论的问题、待办、没有下文的计划。确实没有就写「无」。\n\n"
+        "Paragraph 2: a short list of key facts, one per line, each line starting with 「· 」; only hard "
+        "information that can be checked, such as dates, numbers, names and conclusions.\n"
+        "Paragraph 3: what is still open: questions raised in the input that never got an answer, to-dos, plans "
+        "with no follow-up. If there truly are none, write 「无」.\n\n"
     )
 
     parts = [header]
     if digest_items:
-        child_cn = LAYER_CFG[INPUT_CHILD[period.layer]]["cn"]
-        parts.append(f"### 一、{ref}的{child_cn}（{len(digest_items)} 篇，已是二手总结）\n\n{_digest_block(digest_items)}\n\n")
+        child = INPUT_CHILD[period.layer]
+        parts.append(f"### Part 1: this {unit}'s {LAYER_CFG[child]['cn']} ({LAYER_EN[child]} digests; "
+                     f"{len(digest_items)} of them, already second-hand summaries)\n\n{_digest_block(digest_items)}\n\n")
         parts.append(
-            f"### 二、{ref}最重要的原始记忆（按 importance 取前 {len(raw_items)} 条，"
-            f"用来校正上面二手总结里的失真）\n\n{_raw_block(raw_items, tz, entry_limit)}\n"
+            f"### Part 2: this {unit}'s most important raw memories (the top {len(raw_items)} by importance, "
+            f"for correcting drift in the summaries above)\n\n{_raw_block(raw_items, tz, entry_limit)}\n"
         )
     else:
         note = ""
         if period.layer not in ("day", "week"):
-            note = f"（{ref}没有可用的下层总结，直接依据原始记忆书写）"
-        parts.append(f"### 原始记忆（{len(raw_items)} 条，按时间升序）{note}\n\n{_raw_block(raw_items, tz, entry_limit)}\n")
+            note = f" (this {unit} has no lower-layer digests; write straight from the raw memories)"
+        parts.append(f"### Raw memories ({len(raw_items)}, oldest first){note}\n\n{_raw_block(raw_items, tz, entry_limit)}\n")
     if dropped:
-        parts.append(f"\n注：{ref}另有 {dropped} 条 importance 较低的记忆因篇幅所限未纳入，"
-                     f"总结时不必宣称已覆盖全部内容。\n")
+        parts.append(f"\nNote: {dropped} lower-importance memories from this {unit} were left out for length; "
+                     f"don't claim the digest covers everything.\n")
     # Restating the limit after the material measurably helps — by the time the
     # model reaches the end of a 70k-character prompt the header has faded.
-    parts.append(f"\n以上是全部材料。现在直接开始输出{cn}正文，三段式，全文不超过 {max_chars} 字。\n")
+    parts.append(f"\nThat is all the material. Now write the {cn} itself: three paragraphs, in Chinese, "
+                 f"at most {max_chars} Chinese characters.\n")
     return "".join(parts)
 
 
