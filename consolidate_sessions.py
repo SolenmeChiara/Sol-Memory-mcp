@@ -48,6 +48,8 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3.5-flash-l
 # Ollama fallback
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
+# Unload the chat model right after each call (same knob as memory_mcp.py); "5m" keeps it.
+OLLAMA_CHAT_KEEP_ALIVE = os.environ.get("OLLAMA_CHAT_KEEP_ALIVE", "0").strip()
 
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "120"))
 MAX_CONSECUTIVE_FAILURES = 10
@@ -132,6 +134,9 @@ def _call_ollama_local(prompt: str) -> str:
         "temperature": 0.3,
         "stream": False,
     }
+    if OLLAMA_CHAT_KEEP_ALIVE:
+        ka = OLLAMA_CHAT_KEEP_ALIVE
+        payload["keep_alive"] = int(ka) if ka.lstrip("-").isdigit() else ka
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"

@@ -9,3 +9,5 @@ cd /d D:\ClaudeExtentions\MCP\Sol-Memory-mcp
 echo. >> logs\digest.log
 echo ===== run %DATE% %TIME% ===== >> logs\digest.log
 C:\Python313\python.exe digest_rollup.py --db "D:\ClaudeExtentions\MCP\Sol-Memory-mcp\memory.db" --claude-cmd "C:\Users\xgq19\.local\bin\claude.exe" --exclude-tier seabed >> logs\digest.log 2>&1
+rem Backfill embeddings for the digests just generated (idempotent; exits in seconds when nothing is pending).
+C:\Python313\python.exe reindex_embeddings.py --db "D:\ClaudeExtentions\MCP\Sol-Memory-mcp\memory.db" >> logs\digest.log 2>&1

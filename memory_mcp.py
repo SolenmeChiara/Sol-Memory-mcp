@@ -77,6 +77,46 @@ OLLAMA_BASE_URL: str = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434
 OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 OLLAMA_TIMEOUT: float = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
 OLLAMA_EMBED_MODEL: str = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:4b")
+# Context window requested for /api/embed. Without it Ollama loads the embed
+# model at its global default (32k on this box -> 7.25 GB resident); the input
+# is clipped to 2000 chars (~1.4k tokens measured on CJK-heavy text), so 4096
+# is plenty and loads at ~3.2 GB. Vectors are identical for inputs that fit.
+OLLAMA_EMBED_NUM_CTX: int = int(os.environ.get("OLLAMA_EMBED_NUM_CTX", "4096"))
+
+
+def _keep_alive_value(raw: str):
+    """Parse an Ollama keep_alive knob from the environment.
+
+    Ollama accepts a duration string ("30s", "2h"), a number of seconds, 0 to
+    unload right after the call, or a negative number to keep the model loaded
+    indefinitely. Numeric strings become ints; "" disables sending the field.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    if raw[-1:] in ("s", "m", "h"):  # Go durations: 30s, 5m, 2h, 500ms
+        return raw
+    sys.stderr.write(f"[memory-mcp] keep_alive {raw!r} not understood; not sending it\n")
+    return None
+
+
+# keep_alive for the chat model (emotion pass on every save, summaries, scent).
+# Default 0: Ollama unloads it right after each call so the chat model (about
+# 6.5 GB of host commit while loaded at Ollama's 32k default) does not stay
+# resident; each call then pays a reload (a few seconds, these callers run in
+# the background). The embed model defaults to -1 (no idle timeout); note that
+# on this box loading the chat model evicts it anyway, so it is reloaded (~2 s)
+# on the next embed rather than being truly resident.
+OLLAMA_CHAT_KEEP_ALIVE = _keep_alive_value(os.environ.get("OLLAMA_CHAT_KEEP_ALIVE", "0"))
+OLLAMA_EMBED_KEEP_ALIVE = _keep_alive_value(os.environ.get("OLLAMA_EMBED_KEEP_ALIVE", "-1"))
 
 # ---- Import-extraction provider (.env driven; refreshed in main() after _load_dotenv) ----
 # Which LLM the /import extraction path talks to. "ollama" (default) keeps the
@@ -120,7 +160,8 @@ DIGESTED_PRUNE_DAYS: int = int(os.environ.get("DIGESTED_PRUNE_DAYS", "90"))     
 DIGESTED_PRUNE_INTERVAL_HOURS: float = float(os.environ.get("DIGESTED_PRUNE_INTERVAL_HOURS", "24"))  # daemon sweep interval
 
 # ---- Backup & WAL maintenance ----
-BACKUP_KEEP: int = int(os.environ.get("BACKUP_KEEP", "3"))                                    # rolling daily backups to retain
+BACKUP_KEEP: int = int(os.environ.get("BACKUP_KEEP", "7"))                                    # rolling daily backups to retain
+BACKUP_KEEP_MONTHS: int = int(os.environ.get("BACKUP_KEEP_MONTHS", "6"))                      # plus the first daily copy of each of the newest N months
 WAL_CHECKPOINT_INTERVAL_HOURS: float = float(os.environ.get("WAL_CHECKPOINT_INTERVAL_HOURS", "1"))  # explicit checkpoint cadence
 
 SUMMARIZE_DRY_RUN: bool = False
@@ -268,11 +309,22 @@ def _start_maintenance_daemon(store: "MemoryStore", db_path: Path) -> None:
         finally:
             dst.close()
         old_files = sorted(backups_dir.glob("memory-????-??-??.db"))
-        for old in old_files[:-BACKUP_KEEP]:
-            old.unlink(missing_ok=True)
+        keep = set(old_files[-BACKUP_KEEP:])
+        # Monthly anchors: the earliest dated copy of each of the newest
+        # BACKUP_KEEP_MONTHS months stays too, so a migration no longer needs a
+        # hand-made "pre-xxx" copy (19 of those had piled up to 7 GB by 2026-11).
+        first_of_month = {}
+        for f in old_files:
+            first_of_month.setdefault(f.name[7:14], f)   # "memory-YYYY-MM-DD.db" → "YYYY-MM"
+        for month in sorted(first_of_month)[-BACKUP_KEEP_MONTHS:]:
+            keep.add(first_of_month[month])
+        for old in old_files:
+            if old not in keep:
+                old.unlink(missing_ok=True)
         sys.stderr.write(
             f"[maint] daily backup written: {target.name} "
-            f"({target.stat().st_size // 1048576}MB, keeping {BACKUP_KEEP})\n"
+            f"({target.stat().st_size // 1048576}MB, keeping {BACKUP_KEEP} daily "
+            f"+ first-of-month for {BACKUP_KEEP_MONTHS} months)\n"
         )
 
     def _watch_expiry() -> None:
@@ -328,6 +380,9 @@ def _call_ollama(prompt: str, *, timeout: Optional[float] = None,
         "stream": False,
         "temperature": 0.3,
     }
+    if OLLAMA_CHAT_KEEP_ALIVE is not None:
+        # Honoured by Ollama's OpenAI-compatible endpoint (verified 0.40.8).
+        payload["keep_alive"] = OLLAMA_CHAT_KEEP_ALIVE
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -354,6 +409,10 @@ def _call_ollama_embedding(text: str, *, timeout: Optional[float] = None) -> lis
     """
     url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
     payload = {"model": OLLAMA_EMBED_MODEL, "input": text[:2000]}
+    if OLLAMA_EMBED_NUM_CTX > 0:
+        payload["options"] = {"num_ctx": OLLAMA_EMBED_NUM_CTX}
+    if OLLAMA_EMBED_KEEP_ALIVE is not None:
+        payload["keep_alive"] = OLLAMA_EMBED_KEEP_ALIVE
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
@@ -790,6 +849,45 @@ BREATH_WORKING_ROW_CHARS = int(os.environ.get("BREATH_WORKING_ROW_CHARS", "300")
 BREATH_WORKING_ROW_CHARS_FULL = int(
     os.environ.get("BREATH_WORKING_ROW_CHARS_FULL", "0")
 )
+# PINNED / CORE per-row content caps (2026-11-17). Both segments rendered
+# uncapped; the pinned 入住索引 alone runs ~1,200 chars and a CORE row ~1,000,
+# so on a 名册 rotation day the two of them spent most of the 3500-char pot
+# before WORKING's seed row and WORKING showed 1 of 5 (seen again 11/17 01:2x).
+# Tool path clips with the same 〔截断…〕 marker (full text one get away);
+# the unlimited /breath-hook path takes the _FULL value, where 0 = no cap.
+# Scratch runs 11/17 20:0x on a copy of the live DB (3500 pot): PINNED 500
+# keeps the index's first four pointers and is the 100 chars that let a third
+# WORKING row land; CORE 500 still let CORE's second row take what WORKING
+# needed, so CORE sits at 300 like the other ranked tiers. Together with the
+# deepening order below: WORKING 2 → 3 rows, WATCH 0 → 1, PINNED/CORE clipped.
+BREATH_PINNED_ROW_CHARS = int(os.environ.get("BREATH_PINNED_ROW_CHARS", "500"))
+BREATH_PINNED_ROW_CHARS_FULL = int(
+    os.environ.get("BREATH_PINNED_ROW_CHARS_FULL", "0")
+)
+BREATH_CORE_ROW_CHARS = int(os.environ.get("BREATH_CORE_ROW_CHARS", "300"))
+BREATH_CORE_ROW_CHARS_FULL = int(
+    os.environ.get("BREATH_CORE_ROW_CHARS_FULL", "0")
+)
+# WATCH / TOP UNRESOLVED per-row caps, same reason: on the 11/17 scratch test
+# the ~700 chars freed by capping PINNED+CORE went straight into a fatter TOP
+# seed row (387 → 971) and WORKING still showed 2 of 5. Any uncapped segment
+# can eat the pot, so every ranked segment now clips on the tool path.
+BREATH_WATCH_ROW_CHARS = int(os.environ.get("BREATH_WATCH_ROW_CHARS", "350"))
+BREATH_WATCH_ROW_CHARS_FULL = int(
+    os.environ.get("BREATH_WATCH_ROW_CHARS_FULL", "0")
+)
+BREATH_TOP_ROW_CHARS = int(os.environ.get("BREATH_TOP_ROW_CHARS", "300"))
+BREATH_TOP_ROW_CHARS_FULL = int(os.environ.get("BREATH_TOP_ROW_CHARS_FULL", "0"))
+# Pass-2 deepening order (2026-11-17). Pass 1 seeds one row per tier in
+# display order; Pass 2 used to spend the rest in that same order, so a second
+# PINNED row and CORE's second rotation row always landed before WORKING's
+# second row — capping rows only moved the pot to them (scratch runs: WORKING
+# stayed at 1 of 5 while PINNED went 1 → 2). The live-promise tiers now deepen
+# first. Names, comma-separated; unknown names are ignored, missing ones are
+# appended in display order so nothing is silently dropped.
+BREATH_DEEPEN_ORDER = os.environ.get(
+    "BREATH_DEEPEN_ORDER", "working,watch,pinned,core,top,chronicle"
+)
 # A fresh digest sits in tier='watch' for a week or two, which means the very row
 # CHRONICLE pins would also show up under WATCH — the same memory printed twice
 # in one breath. With this on, ids claimed by CHRONICLE are excluded from the
@@ -926,9 +1024,11 @@ def _compose_breath_output(
     `budget` is the character budget for the rendered segments:
       * None (default) — fall back to the module-level BREATH_TOKEN_BUDGET,
         3500 chars, which is what the extmcp_breath tool and the CLI subcommand
-        get. 3000 was the historic value; the five tiers need 3020 just to show
-        one row each, so it left the heaviest TOP row permanently outside the
-        door. 3500 fits every tier's first row plus the second PINNED one.
+        get. 3000 was the historic value; before the per-row caps the five
+        tiers needed 3020 just to show one row each, so the heaviest TOP row
+        stayed outside the door. With the caps (PINNED 500, WATCH 350,
+        WORKING/CORE/TOP 300) 3500 fits every tier's first row and leaves room
+        for two or three more, handed out in BREATH_DEEPEN_ORDER (working first).
       * 0 or any negative value — UNLIMITED: no segment header and no row is
         ever dropped. Used by GET /breath-hook, whose consumer (the nudge
         injector) renders memories incrementally and therefore wants the whole
@@ -1123,14 +1223,22 @@ def _compose_breath_output(
     working_row_cap = (
         BREATH_WORKING_ROW_CHARS_FULL if unlimited else BREATH_WORKING_ROW_CHARS
     )
+    pinned_row_cap = (
+        BREATH_PINNED_ROW_CHARS_FULL if unlimited else BREATH_PINNED_ROW_CHARS
+    )
+    core_row_cap = BREATH_CORE_ROW_CHARS_FULL if unlimited else BREATH_CORE_ROW_CHARS
+    watch_row_cap = (
+        BREATH_WATCH_ROW_CHARS_FULL if unlimited else BREATH_WATCH_ROW_CHARS
+    )
+    top_row_cap = BREATH_TOP_ROW_CHARS_FULL if unlimited else BREATH_TOP_ROW_CHARS
 
     segments = [
-        ("=== PINNED ===", pinned_recs, lambda r: "999.00", None, 0),
+        ("=== PINNED ===", pinned_recs, lambda r: "999.00", None, pinned_row_cap),
         ("\n=== CHRONICLE (编年) ===", chron_recs, _decay_w, None, chron_row_cap),
-        ("\n=== CORE ===", core_recs, _decay_w, None, 0),
+        ("\n=== CORE ===", core_recs, _decay_w, None, core_row_cap),
         (working_header, working_recs, _decay_w, _working_suffix, working_row_cap),
-        ("\n=== WATCH ===", watch_recs, _decay_w, _watch_suffix, 0),
-        ("\n=== TOP UNRESOLVED (by decay) ===", un_picked, _decay_w, None, 0),
+        ("\n=== WATCH ===", watch_recs, _decay_w, _watch_suffix, watch_row_cap),
+        ("\n=== TOP UNRESOLVED (by decay) ===", un_picked, _decay_w, None, top_row_cap),
     ]
     CHRON_SEG = 1
     rendered = [
@@ -1192,10 +1300,20 @@ def _compose_breath_output(
                 seeded[i] = j
                 break
 
-    # Pass 2 — spend what is left, still in segment order, so the tiers that
-    # matter most deepen first. Budget freed by a short leading tier is not
-    # wasted; when unlimited, every remaining row lands here.
-    for i, rows in enumerate(rendered):
+    # Pass 2 — spend what is left, in BREATH_DEEPEN_ORDER (WORKING and WATCH
+    # first by default), so the live-promise tiers deepen before PINNED's and
+    # CORE's second rows. Budget freed by a short tier is not wasted; when
+    # unlimited, every remaining row lands here. Display order is restored
+    # below, so this only decides who gets the budget, not where rows print.
+    seg_names = ["pinned", "chronicle", "core", "working", "watch", "top"]
+    deepen: list[int] = []
+    for name in BREATH_DEEPEN_ORDER.split(","):
+        name = name.strip().lower()
+        if name in seg_names and seg_names.index(name) not in deepen:
+            deepen.append(seg_names.index(name))
+    deepen.extend(i for i in range(len(segments)) if i not in deepen)
+    for i in deepen:
+        rows = rendered[i]
         for j in range(len(rows)):
             if j == seeded[i]:
                 continue
@@ -2943,8 +3061,8 @@ _IMPORT_EXTRACT_TMPL = (
     "**重要：鼓励连续叙事，反对碎片化**\n"
     "- 把围绕同一主题/事件的细节**合并到一条 content 里**，保留时间顺序、因果关系、情感变化。\n"
     "- 宁可少而完整，也不要拆成孤立的事实碎片。\n"
-    "- 反面示例（禁止）：拆成「去了公交站」「坐了 1ce 路」「到了 UTM」三条。\n"
-    "- 正面示例（推荐）：合并成「今天从家出门坐 1ce 路去 UTM，路上讨论了 X」一条完整叙事。\n"
+    "- 反面示例（禁止）：拆成「出了门」「坐上车」「到了图书馆」三条。\n"
+    "- 正面示例（推荐）：合并成「今天出门坐车去图书馆，路上讨论了 X」一条完整叙事。\n"
     "- content 可以较长（数百字无妨），优先完整性而非简洁。\n"
     "- 只有真正**互不相关**的主题才应拆成多条（例如同一段对话里既聊了约会又聊了工作）。\n"
     "\n"
@@ -3676,7 +3794,7 @@ TOOLS = [
             "extmcp_link_memory). The result includes `content_preview` and `content_len`. "
             "Optional `tier` places the memory in the layered-memory architecture "
             "(working/watch/core/archive/seabed; '' = ordinary). On update, an omitted `tier` "
-            "keeps the existing tier. Passing resolved=true on a `working` memory auto-archives "
+            "keeps the existing tier. Passing resolved=true on a `working` or `watch` memory auto-archives "
             "it (tier→archive). Optional `author` tags who wrote the entry (see the param); "
             "on update an omitted author keeps the stored one."
         ),
@@ -4115,8 +4233,9 @@ TOOLS = [
             "内容按行截断，要全文用 extmcp_get_memory 按行首 id 取；"
             "这一段不参与激活，也不占用其余五段的篇幅预算。"
             "WORKING 段先按 next_due 由近到远、再按更新时间排（过期超过 7 天的回落到按更新时间排，"
-            "行尾标〔已过期 N 天，疑似已完成未销账，请核对〕），每行正文截到 300 字"
-            "（尾注〔截断…〕，全文用 extmcp_get_memory 取）；"
+            "行尾标〔已过期 N 天，疑似已完成未销账，请核对〕）。"
+            "工具路径上各段每行正文都有截断上限（WORKING 300 / WATCH 350 / CORE 300 / TOP 300 / PINNED 500 字，"
+            "尾注〔截断…〕，全文用 extmcp_get_memory 取）；各段先各露一行，第二行起按 working、watch、pinned、core、top 的顺序加深；"
             "WORKING / WATCH 行尾带〔到期 MM-DD〕或〔已过期 N 天〕。"
             "同事件的非主条与已被取代的旧条不在 CORE / WORKING / WATCH / TOP 段出现。"
         ),
@@ -4259,10 +4378,10 @@ def _apply_tier_write(store: MemoryStore, memory_id: str,
     final_tier = user_tier if user_tier is not None else prev_tier
     final_until = prev_tier_until
     auto_archived = False
-    # Auto-archive: resolving a working memory closes the loop → biography.
+    # Auto-archive: resolving a working or watch memory closes the loop → biography.
     # Requires resolved=true *in this call*, so an unrelated edit to an
     # already-resolved working memory doesn't silently archive it.
-    if resolved_given and resolved_val and final_tier == "working":
+    if resolved_given and resolved_val and final_tier in ("working", "watch"):
         final_tier = "archive"
         final_until = ""
         auto_archived = True
@@ -4664,7 +4783,7 @@ def handle_tool(store: MemoryStore, name: str, args: Dict[str, Any]) -> Any:
         if is_update:
             note += "; unspecified fields preserved"
         if auto_archived:
-            note = "working 记忆已结案，自动归档 (tier→archive)；" + note
+            note = "working/watch 记忆已结案，自动归档 (tier→archive)；" + note
         if notes:
             note += "; " + "; ".join(notes)
         rec = store.get_memory(memory_id) or rec

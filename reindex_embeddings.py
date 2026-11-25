@@ -38,6 +38,10 @@ from pathlib import Path
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:4b")
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
+# Same two knobs memory_mcp.py sends, so a reindex run never reloads the embed
+# model at Ollama's 32k default (~7.25 GB) beside the service's 4096 instance.
+OLLAMA_EMBED_NUM_CTX = int(os.environ.get("OLLAMA_EMBED_NUM_CTX", "4096") or 0)
+OLLAMA_EMBED_KEEP_ALIVE = os.environ.get("OLLAMA_EMBED_KEEP_ALIVE", "-1").strip()
 MAX_CHARS = 2000
 MAX_CONSECUTIVE_FAILURES = 10
 
@@ -87,7 +91,13 @@ def fetch_embedding(text: str) -> list[float]:
       Other exceptions — genuine service problems (timeout, unreachable, etc).
         Caller counts these toward the consecutive-failure abort threshold.
     """
-    body = json.dumps({"model": OLLAMA_EMBED_MODEL, "input": (text or "")[:MAX_CHARS]}).encode()
+    payload = {"model": OLLAMA_EMBED_MODEL, "input": (text or "")[:MAX_CHARS]}
+    if OLLAMA_EMBED_NUM_CTX > 0:
+        payload["options"] = {"num_ctx": OLLAMA_EMBED_NUM_CTX}
+    if OLLAMA_EMBED_KEEP_ALIVE:
+        ka = OLLAMA_EMBED_KEEP_ALIVE
+        payload["keep_alive"] = int(ka) if ka.lstrip("-").isdigit() else ka
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed",
         data=body,
@@ -289,6 +299,7 @@ def main() -> None:
     # The web path (memory_mcp importing run_reindex) already has .env loaded
     # into os.environ before this module is imported, so it's unaffected.
     global OLLAMA_BASE_URL, OLLAMA_EMBED_MODEL, OLLAMA_TIMEOUT
+    global OLLAMA_EMBED_NUM_CTX, OLLAMA_EMBED_KEEP_ALIVE
     try:
         from consolidate_sessions import _load_dotenv
         _load_dotenv(Path(__file__).resolve().parent)
@@ -297,6 +308,8 @@ def main() -> None:
     OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
     OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_EMBED_MODEL)
     OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", str(OLLAMA_TIMEOUT)))
+    OLLAMA_EMBED_NUM_CTX = int(os.environ.get("OLLAMA_EMBED_NUM_CTX", str(OLLAMA_EMBED_NUM_CTX)) or 0)
+    OLLAMA_EMBED_KEEP_ALIVE = os.environ.get("OLLAMA_EMBED_KEEP_ALIVE", OLLAMA_EMBED_KEEP_ALIVE).strip()
 
     parser = argparse.ArgumentParser(
         description="Backfill / re-align embeddings for memories in the SQLite store"

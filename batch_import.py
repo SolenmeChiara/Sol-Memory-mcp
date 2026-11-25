@@ -43,6 +43,16 @@ OLLAMA_BASE_URL: str = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434
 OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 OLLAMA_EMBED_MODEL: str = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:4b")
 OLLAMA_TIMEOUT: float = float(os.environ.get("OLLAMA_TIMEOUT", "180"))
+# Same knobs memory_mcp.py sends: embed at a 4096 window (not Ollama's 32k default),
+# chat model unloaded right after each call, embed model kept resident.
+OLLAMA_EMBED_NUM_CTX: int = int(os.environ.get("OLLAMA_EMBED_NUM_CTX", "4096") or 0)
+OLLAMA_EMBED_KEEP_ALIVE: str = os.environ.get("OLLAMA_EMBED_KEEP_ALIVE", "-1").strip()
+OLLAMA_CHAT_KEEP_ALIVE: str = os.environ.get("OLLAMA_CHAT_KEEP_ALIVE", "0").strip()
+
+
+def _keep_alive(raw: str):
+    """'0' / '-1' / '300' → int seconds; '5m' and other duration strings pass through."""
+    return int(raw) if raw.lstrip("-").isdigit() else raw
 N_EMBED_WORKERS = 2
 
 # ---------------------------------------------------------------------------
@@ -109,6 +119,8 @@ def _call_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
         "stream": False,
         "temperature": 0.3,
     }
+    if OLLAMA_CHAT_KEEP_ALIVE:
+        payload["keep_alive"] = _keep_alive(OLLAMA_CHAT_KEEP_ALIVE)
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
@@ -228,6 +240,10 @@ def _call_llm(provider: str, prompt: str, model: str, api_key: Optional[str]) ->
 def _call_ollama_embedding(text: str) -> List[float]:
     url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/embed"
     payload = {"model": OLLAMA_EMBED_MODEL, "input": text[:2000]}
+    if OLLAMA_EMBED_NUM_CTX > 0:
+        payload["options"] = {"num_ctx": OLLAMA_EMBED_NUM_CTX}
+    if OLLAMA_EMBED_KEEP_ALIVE:
+        payload["keep_alive"] = _keep_alive(OLLAMA_EMBED_KEEP_ALIVE)
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
@@ -288,8 +304,8 @@ _IMPORT_EXTRACT_TMPL = (
     "**重要：鼓励连续叙事，反对碎片化**\n"
     "- 把围绕同一主题/事件的细节**合并到一条 content 里**，保留时间顺序、因果关系、情感变化。\n"
     "- 宁可少而完整，也不要拆成孤立的事实碎片。\n"
-    "- 反面示例（禁止）：拆成「去了公交站」「坐了 1ce 路」「到了 UTM」三条。\n"
-    "- 正面示例（推荐）：合并成「今天从家出门坐 1ce 路去 UTM，路上讨论了 X」一条完整叙事。\n"
+    "- 反面示例（禁止）：拆成「出了门」「坐上车」「到了图书馆」三条。\n"
+    "- 正面示例（推荐）：合并成「今天出门坐车去图书馆，路上讨论了 X」一条完整叙事。\n"
     "- content 可以较长（数百字无妨），优先完整性而非简洁。\n"
     "- 只有真正**互不相关**的主题才应拆成多条（例如同一段对话里既聊了约会又聊了工作）。\n"
     "\n"

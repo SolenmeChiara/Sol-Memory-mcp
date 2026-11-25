@@ -211,10 +211,15 @@ The `/breath-hook` endpoint itself is **read-only** and never activates memories
 | `EVENT_HALF_DAYS` | after that, weight decays as `exp(-(age-fresh)/EVENT_HALF_DAYS)` | `10` |
 | `EVENT_FLOOR` | floor the above decay never drops below | `0.2` |
 | `NEXT_DUE_OVERDUE_GRACE_DAYS` | days a `next_due` row can be overdue before WORKING breath ordering falls back to update-time order (see [Relations & due dates](#relations--due-dates)) | `7` |
-| `BREATH_TOKEN_BUDGET` | breath output length budget | `3000` |
+| `BREATH_TOKEN_BUDGET` | breath output length budget | `3500` |
 | `BREATH_PINNED_QUOTA` | pinned quota within breath | `2` |
 | `BREATH_WORKING_ROW_CHARS` | per-row truncation for WORKING lines on the token-budgeted `extmcp_breath` path | `300` |
 | `BREATH_WORKING_ROW_CHARS_FULL` | same, on the unlimited `/breath-hook` / injector path (`0` = no cap) | `0` |
+| `BREATH_PINNED_ROW_CHARS` / `_FULL` | per-row truncation for PINNED lines (budgeted path / unlimited path) | `500` / `0` |
+| `BREATH_CORE_ROW_CHARS` / `_FULL` | per-row truncation for CORE lines | `300` / `0` |
+| `BREATH_WATCH_ROW_CHARS` / `_FULL` | per-row truncation for WATCH lines (350: an impression strip at the house limit of 350 chars shows whole) | `350` / `0` |
+| `BREATH_TOP_ROW_CHARS` / `_FULL` | per-row truncation for TOP / UNRESOLVED lines | `300` / `0` |
+| `BREATH_DEEPEN_ORDER` | which segments get their 2nd+ rows first once every segment has one seeded row (comma list) | `working,watch,pinned,core,top,chronicle` |
 
 `.env` (next to `memory.db`, or next to `memory_mcp.py`) is now loaded **before** these module-level constants are read, so any of the above can live in `.env` instead of the process environment; an already-set process env var still wins.
 
@@ -232,6 +237,11 @@ The three LLM paths — web `/import` extraction, `batch_import.py` CLI extracti
 | `OPENROUTER_MODEL` | consolidation model (also the extraction model when `IMPORT_PROVIDER=openrouter` and `IMPORT_MODEL` is empty) | `google/gemini-3.5-flash-lite` |
 | `OLLAMA_MODEL` | local chat model (extraction default + failover target) | `gemma4:e4b` |
 | `OLLAMA_EMBED_MODEL` | embedding model (changing it requires a full re-embed) | `qwen3-embedding:4b` |
+| `OLLAMA_EMBED_NUM_CTX` | `num_ctx` sent with `/api/embed`; input is clipped to 2000 chars so 4096 is ample and keeps the embed model ~3 GB resident instead of ~7 GB at Ollama's 32k default (`0` = don't send) | `4096` |
+| `OLLAMA_CHAT_KEEP_ALIVE` | `keep_alive` sent with chat calls (emotion pass, summaries, scent); `0` unloads the chat model right after each call, a duration like `5m` keeps it, empty = don't send. `/import` extraction and `rescore_importance` pay the cold load per chunk / per row too — bulk jobs may set `5m` | `0` |
+| `BACKUP_KEEP` | rolling daily backups (`backups/memory-YYYY-MM-DD.db`, written on the first maintenance tick of each day) to retain | `7` |
+| `BACKUP_KEEP_MONTHS` | also keep the first daily copy of each of the newest N months as anchors; no hand-made pre-migration copies needed | `6` |
+| `OLLAMA_EMBED_KEEP_ALIVE` | `keep_alive` sent with `/api/embed`; `-1` keeps the embed model resident (Ollama may still evict it to load the chat model) | `-1` |
 
 Misconfiguration degrades rather than breaks: a cloud `IMPORT_PROVIDER` whose key is missing is treated as `ollama` (one stderr warning), and a cloud extraction call that fails retries **once** on the local model for that chunk. The `/import` page shows the currently effective `extraction provider / model ｜ consolidation backend / model` line, sourced from `GET /stats` (`import_provider`, `import_model`, `consolidate_backend`, `consolidate_model`).
 
@@ -477,10 +487,15 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 | `EVENT_HALF_DAYS` | 超过之后按 `exp(-(建档天数-EVENT_FRESH_DAYS)/EVENT_HALF_DAYS)` 衰减 | `10` |
 | `EVENT_FLOOR` | 上述衰减的下限 | `0.2` |
 | `NEXT_DUE_OVERDUE_GRACE_DAYS` | `next_due` 行过期多少天后 WORKING breath 排序回落到按更新时间（见上方「记忆关系与到期日」） | `7` |
-| `BREATH_TOKEN_BUDGET` | breath 输出字数预算 | `3000` |
+| `BREATH_TOKEN_BUDGET` | breath 输出字数预算 | `3500` |
 | `BREATH_PINNED_QUOTA` | breath 中 pinned 配额 | `2` |
 | `BREATH_WORKING_ROW_CHARS` | 带预算的 `extmcp_breath` 路径下 WORKING 每行截断字数 | `300` |
 | `BREATH_WORKING_ROW_CHARS_FULL` | 不设预算的 `/breath-hook` / 注入器路径下同上（`0` = 不截断） | `0` |
+| `BREATH_PINNED_ROW_CHARS` / `_FULL` | PINNED 每行截断字数（带预算路径 / 不设预算路径） | `500` / `0` |
+| `BREATH_CORE_ROW_CHARS` / `_FULL` | CORE 每行截断字数 | `300` / `0` |
+| `BREATH_WATCH_ROW_CHARS` / `_FULL` | WATCH 每行截断字数（350，印象条按家规 350 字内就能整条露出） | `350` / `0` |
+| `BREATH_TOP_ROW_CHARS` / `_FULL` | TOP / UNRESOLVED 每行截断字数 | `300` / `0` |
+| `BREATH_DEEPEN_ORDER` | 各段都种下一行后，第二行起按哪个顺序加深（逗号分隔） | `working,watch,pinned,core,top,chronicle` |
 
 `.env`（放 `memory.db` 旁边或 `memory_mcp.py` 旁边）现在会在读取上面这些模块级常数**之前**加载，所以它们都可以写进 `.env`；进程环境变量如果已经设了则优先级更高。
 
@@ -498,6 +513,11 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 | `OPENROUTER_MODEL` | 合并模型（`IMPORT_PROVIDER=openrouter` 且 `IMPORT_MODEL` 为空时，提取也复用它） | `google/gemini-3.5-flash-lite` |
 | `OLLAMA_MODEL` | 本地聊天模型（提取默认值 + 降级目标） | `gemma4:e4b` |
 | `OLLAMA_EMBED_MODEL` | embedding 模型（改它必须全量重嵌） | `qwen3-embedding:4b` |
+| `OLLAMA_EMBED_NUM_CTX` | 随 `/api/embed` 发送的 `num_ctx`；输入截到 2000 字，4096 足够，嵌入模型常驻约 3 GB 而非 Ollama 默认 32k 时的约 7 GB（`0` = 不发送） | `4096` |
+| `OLLAMA_CHAT_KEEP_ALIVE` | 聊天调用（情绪分析、摘要、scent）随发的 `keep_alive`；`0` 调用完立刻卸载聊天模型，`5m` 之类则保留，空 = 不发送；`/import` 抽取与 `rescore_importance` 每块／每行也各付一次冷装，批量任务可设 `5m` | `0` |
+| `BACKUP_KEEP` | 自动日备份（`backups/memory-YYYY-MM-DD.db`，每天首次维护 tick 时写）保留最近几份 | `7` |
+| `BACKUP_KEEP_MONTHS` | 另保留最近 N 个月里每月第一份日备份作锚点；迁移前不必再手工复制库 | `6` |
+| `OLLAMA_EMBED_KEEP_ALIVE` | `/api/embed` 随发的 `keep_alive`；`-1` 让嵌入模型常驻（装聊天模型时 Ollama 仍可能把它挤出去） | `-1` |
 
 配错了只降级不瘫痪：云端 provider 缺对应 key 时按 `ollama` 处理（stderr 提示一行），云端提取调用失败则该 chunk 用本地模型兜底重试**一次**。`/import` 页面常驻显示当前生效的 `提取 provider / 模型 ｜ 合并 backend / 模型`，数据来自 `GET /stats`（`import_provider`、`import_model`、`consolidate_backend`、`consolidate_model`）。
 
