@@ -118,6 +118,14 @@ def _keep_alive_value(raw: str):
 OLLAMA_CHAT_KEEP_ALIVE = _keep_alive_value(os.environ.get("OLLAMA_CHAT_KEEP_ALIVE", "0"))
 OLLAMA_EMBED_KEEP_ALIVE = _keep_alive_value(os.environ.get("OLLAMA_EMBED_KEEP_ALIVE", "-1"))
 
+# Context window requested for the emotion pass. Its prompt is the first 500
+# chars of the memory plus a short instruction (140-470 tokens measured), yet
+# without this Ollama loads the chat model at its global default (32k on this
+# box -> 12.2 GiB predicted for gemma4:e4b; 2048 -> 9.2 GiB). Sent through the
+# native /api/chat endpoint, because /v1/chat/completions has no num_ctx field.
+# 0 = don't send (old behaviour: OpenAI-compatible endpoint, global default).
+OLLAMA_EMOTION_NUM_CTX: int = int(os.environ.get("OLLAMA_EMOTION_NUM_CTX", "2048"))
+
 # ---- Import-extraction provider (.env driven; refreshed in main() after _load_dotenv) ----
 # Which LLM the /import extraction path talks to. "ollama" (default) keeps the
 # historical local-only behaviour; "openrouter"/"gemini" send chunks to the cloud
@@ -398,6 +406,40 @@ def _call_ollama(prompt: str, *, timeout: Optional[float] = None,
     return parsed["choices"][0]["message"]["content"]
 
 
+def _call_ollama_native(prompt: str, *, num_ctx: int,
+                        timeout: Optional[float] = None,
+                        model: Optional[str] = None) -> str:
+    """Call Ollama's native /api/chat with an explicit context window.
+
+    Same contract as _call_ollama (one user message in, the reply text out),
+    for short prompts that should not load the chat model at the server-wide
+    default context. Thinking is switched off so the reply is the answer only.
+    """
+    url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat"
+    payload: dict[str, Any] = {
+        "model": model or OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0.3, "num_ctx": int(num_ctx)},
+    }
+    if OLLAMA_CHAT_KEEP_ALIVE is not None:
+        payload["keep_alive"] = OLLAMA_CHAT_KEEP_ALIVE
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(
+        req, timeout=OLLAMA_TIMEOUT if timeout is None else timeout
+    ) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    parsed = json.loads(body)
+    return parsed["message"]["content"]
+
+
 def _call_ollama_embedding(text: str, *, timeout: Optional[float] = None) -> list:
     """Embed `text` with the local Ollama embedding model; [] on any failure.
 
@@ -625,7 +667,20 @@ _EMOTION_PROMPT = (
 
 def _analyze_emotion(content: str) -> tuple:
     try:
-        raw = _call_ollama(_EMOTION_PROMPT + content[:500])
+        prompt = _EMOTION_PROMPT + content[:500]
+        raw = ""
+        if OLLAMA_EMOTION_NUM_CTX > 0:
+            try:
+                raw = _call_ollama_native(prompt, num_ctx=OLLAMA_EMOTION_NUM_CTX)
+            except Exception as exc:
+                # e.g. a model/server that rejects the native request: fall
+                # back to the old path rather than scoring everything neutral.
+                sys.stderr.write(
+                    f"[memory-mcp] emotion native call failed ({exc}); "
+                    "falling back to /v1/chat/completions\n"
+                )
+        if not raw.strip():
+            raw = _call_ollama(prompt)
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]

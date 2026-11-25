@@ -238,6 +238,7 @@ The three LLM paths — web `/import` extraction, `batch_import.py` CLI extracti
 | `OLLAMA_MODEL` | local chat model (extraction default + failover target) | `gemma4:e4b` |
 | `OLLAMA_EMBED_MODEL` | embedding model (changing it requires a full re-embed) | `qwen3-embedding:4b` |
 | `OLLAMA_EMBED_NUM_CTX` | `num_ctx` sent with `/api/embed`; input is clipped to 2000 chars so 4096 is ample and keeps the embed model ~3 GB resident instead of ~7 GB at Ollama's 32k default (`0` = don't send) | `4096` |
+| `OLLAMA_EMOTION_NUM_CTX` | `num_ctx` for the emotion pass on every save, sent through the native `/api/chat` endpoint (the OpenAI-compatible one has no such field); the prompt is the first 500 chars plus a short instruction, so 2048 is ample and the chat model loads smaller than at Ollama's global default (gemma4:e4b: 9.2 GiB predicted instead of 12.2 GiB at 32k). Falls back to the old endpoint if the native call fails (`0` = don't send, old behaviour) | `2048` |
 | `OLLAMA_CHAT_KEEP_ALIVE` | `keep_alive` sent with chat calls (emotion pass, summaries, scent); `0` unloads the chat model right after each call, a duration like `5m` keeps it, empty = don't send. `/import` extraction and `rescore_importance` pay the cold load per chunk / per row too — bulk jobs may set `5m` | `0` |
 | `BACKUP_KEEP` | rolling daily backups (`backups/memory-YYYY-MM-DD.db`, written on the first maintenance tick of each day) to retain | `7` |
 | `BACKUP_KEEP_MONTHS` | also keep the first daily copy of each of the newest N months as anchors; no hand-made pre-migration copies needed | `6` |
@@ -514,6 +515,7 @@ Hook 脚本 `.claude/hooks/session_breath.py` 已随仓库提供。它会：
 | `OLLAMA_MODEL` | 本地聊天模型（提取默认值 + 降级目标） | `gemma4:e4b` |
 | `OLLAMA_EMBED_MODEL` | embedding 模型（改它必须全量重嵌） | `qwen3-embedding:4b` |
 | `OLLAMA_EMBED_NUM_CTX` | 随 `/api/embed` 发送的 `num_ctx`；输入截到 2000 字，4096 足够，嵌入模型常驻约 3 GB 而非 Ollama 默认 32k 时的约 7 GB（`0` = 不发送） | `4096` |
+| `OLLAMA_EMOTION_NUM_CTX` | 每次保存时情绪打分用的 `num_ctx`，走 Ollama 原生 `/api/chat`（OpenAI 兼容接口没有这个字段）；提示只有正文前 500 字加一小段说明，2048 足够，聊天模型装载得比 Ollama 全局默认小（gemma4:e4b：预估 9.2 GiB，32k 时为 12.2 GiB）。原生调用失败会退回旧接口（`0` = 不发送，旧行为） | `2048` |
 | `OLLAMA_CHAT_KEEP_ALIVE` | 聊天调用（情绪分析、摘要、scent）随发的 `keep_alive`；`0` 调用完立刻卸载聊天模型，`5m` 之类则保留，空 = 不发送；`/import` 抽取与 `rescore_importance` 每块／每行也各付一次冷装，批量任务可设 `5m` | `0` |
 | `BACKUP_KEEP` | 自动日备份（`backups/memory-YYYY-MM-DD.db`，每天首次维护 tick 时写）保留最近几份 | `7` |
 | `BACKUP_KEEP_MONTHS` | 另保留最近 N 个月里每月第一份日备份作锚点；迁移前不必再手工复制库 | `6` |
