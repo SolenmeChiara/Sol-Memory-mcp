@@ -126,6 +126,18 @@ OLLAMA_EMBED_KEEP_ALIVE = _keep_alive_value(os.environ.get("OLLAMA_EMBED_KEEP_AL
 # 0 = don't send (old behaviour: OpenAI-compatible endpoint, global default).
 OLLAMA_EMOTION_NUM_CTX: int = int(os.environ.get("OLLAMA_EMOTION_NUM_CTX", "2048"))
 
+# keep_alive for the emotion pass only. Saves tend to come in bursts; with the
+# chat default (0) every save in a burst pays a full reload (~9 s, and the
+# embed model is evicted and reloaded each time). Letting the model linger a
+# few seconds turns a burst into one load: measured 9.0 s cold, 0.4 s for the
+# next calls, unloaded by itself ~20 s after the last one. While loaded at
+# num_ctx 2048 it holds about 6 GB of host commit. "0" restores unload-at-once;
+# "" follows OLLAMA_CHAT_KEEP_ALIVE.
+_emotion_keep_raw = os.environ.get("OLLAMA_EMOTION_KEEP_ALIVE", "20s")
+OLLAMA_EMOTION_KEEP_ALIVE = (
+    _keep_alive_value(_emotion_keep_raw) if _emotion_keep_raw.strip() else OLLAMA_CHAT_KEEP_ALIVE
+)
+
 # ---- Import-extraction provider (.env driven; refreshed in main() after _load_dotenv) ----
 # Which LLM the /import extraction path talks to. "ollama" (default) keeps the
 # historical local-only behaviour; "openrouter"/"gemini" send chunks to the cloud
@@ -408,7 +420,8 @@ def _call_ollama(prompt: str, *, timeout: Optional[float] = None,
 
 def _call_ollama_native(prompt: str, *, num_ctx: int,
                         timeout: Optional[float] = None,
-                        model: Optional[str] = None) -> str:
+                        model: Optional[str] = None,
+                        keep_alive: Any = OLLAMA_CHAT_KEEP_ALIVE) -> str:
     """Call Ollama's native /api/chat with an explicit context window.
 
     Same contract as _call_ollama (one user message in, the reply text out),
@@ -423,8 +436,8 @@ def _call_ollama_native(prompt: str, *, num_ctx: int,
         "think": False,
         "options": {"temperature": 0.3, "num_ctx": int(num_ctx)},
     }
-    if OLLAMA_CHAT_KEEP_ALIVE is not None:
-        payload["keep_alive"] = OLLAMA_CHAT_KEEP_ALIVE
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -671,7 +684,10 @@ def _analyze_emotion(content: str) -> tuple:
         raw = ""
         if OLLAMA_EMOTION_NUM_CTX > 0:
             try:
-                raw = _call_ollama_native(prompt, num_ctx=OLLAMA_EMOTION_NUM_CTX)
+                raw = _call_ollama_native(
+                    prompt, num_ctx=OLLAMA_EMOTION_NUM_CTX,
+                    keep_alive=OLLAMA_EMOTION_KEEP_ALIVE,
+                )
             except Exception as exc:
                 # e.g. a model/server that rejects the native request: fall
                 # back to the old path rather than scoring everything neutral.
